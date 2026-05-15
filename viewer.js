@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC Viewer v1.1.0-test
+ * VDO.Ninja Lossless DC Viewer v1.0.2
  *
  * Inject via:  &js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
  *
@@ -13,27 +13,16 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.1.0-test';
-  const PROTOCOL_VERSION = 2;
+  const VERSION     = '1.0.2';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
-  const FALLBACK_MS = 750;
+  const FALLBACK_MS = 2000;
   const FMT_INT16   = 0;
   const FMT_FLOAT32 = 1;
-  const FRAME_KIND_AUDIO = 0;
-  const FRAME_KIND_FEC = 1;
-  const FEC_GROUP_SIZE = 4;
 
   function log(msg)  { console.log(`[lossless-dc v${VERSION}] ${msg}`); }
   function warn(msg) { console.warn(`[lossless-dc v${VERSION}] ${msg}`); }
-
-  let _losslessDisabled = false;
-  let _showStats = true;
-  try {
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('losslessStats') === '0' || params.get('losslessStats') === 'false') _showStats = false;
-  } catch (_) {}
 
   // -------------------------------------------------------------------------
   // Worklet URL resolution
@@ -60,11 +49,9 @@
 
   function _newPeer(pc, dc) {
     return { pc, dc, stream: null, handshake: null, audioEl: null,
-             savedVolume: 1.0, savedMuted: false, gainNode: null,
+             savedVolume: 1.0, gainNode: null,
              lastFrameMs: 0, lastSeq: -1,
-             expectedSeq: null, pendingAudio: new Map(), pendingFec: new Map(), recentAudio: new Map(),
-             frames: 0, underruns: 0, lateFrames: 0, fecRepaired: 0,
-             fecUnrepaired: 0, zeroFilled: 0, bytes: 0, opusRestored: false };
+             frames: 0, underruns: 0, bytes: 0, opusRestored: false };
   }
 
   // -------------------------------------------------------------------------
@@ -119,12 +106,6 @@
     });
     wn.port.onmessage = (ev) => {
       if (ev.data.type === 'underrun') { peer.underruns++; _updateOverlay(); }
-      if (ev.data.type === 'stats') {
-        peer.bufferDepth = ev.data.bufferDepth || 0;
-        peer.workletUnderruns = ev.data.underruns || 0;
-        peer.workletOverflows = ev.data.overflows || 0;
-      }
-      if (ev.data.type === 'version') window.__LOSSLESS_WORKLET_VERSION = ev.data.version;
     };
     peer.gainNode = _audioCtx.createGain();
     peer.gainNode.gain.value = peer.savedVolume;
@@ -156,9 +137,8 @@
     if (!el) { warn('Opus audio element not found — both streams may play simultaneously'); return; }
     peer.audioEl     = el;
     peer.savedVolume = el.volume > 0 ? el.volume : 1.0;
-    peer.savedMuted  = !!el.muted;
     el.volume        = 0;
-    if (peer.gainNode) peer.gainNode.gain.value = peer.savedMuted ? 0 : peer.savedVolume;
+    if (peer.gainNode) peer.gainNode.gain.value = peer.savedVolume;
     log(`Opus muted (vol=${peer.savedVolume.toFixed(2)})`);
     _startVolumePoll(peer);
   }
@@ -178,12 +158,8 @@
       const v = peer.audioEl.volume;
       if (v !== 0) {
         peer.savedVolume = v;
-        peer.gainNode.gain.value = peer.savedMuted ? 0 : v;
+        peer.gainNode.gain.value = v;
         if (Date.now() - peer.lastFrameMs < FALLBACK_MS) peer.audioEl.volume = 0;
-      }
-      if (peer.audioEl.muted !== peer.savedMuted) {
-        peer.savedMuted = !!peer.audioEl.muted;
-        peer.gainNode.gain.value = peer.savedMuted ? 0 : peer.savedVolume;
       }
       if (peer.lastFrameMs > 0 && Date.now() - peer.lastFrameMs > FALLBACK_MS) {
         warn('DC silent — Opus fallback');
@@ -195,112 +171,6 @@
   // -------------------------------------------------------------------------
   // DC message handler
   // -------------------------------------------------------------------------
-  function _seqDistance(from, to) {
-    return (to - from + 65536) & 0xFFFF;
-  }
-
-  function _groupBase(seq, groupSize) {
-    return seq - (seq % groupSize);
-  }
-
-  function _xorInto(target, source) {
-    for (let i = 0; i < target.length; i++) target[i] ^= source[i] || 0;
-  }
-
-  function _decodePacket(peer, packet) {
-    if (packet.fmt === FMT_INT16) {
-      const i16 = new Int16Array(packet.payload.slice(0));
-      const f32 = new Float32Array(i16.length);
-      for (let i = 0; i < i16.length; i++) f32[i] = i16[i] < 0 ? i16[i] / 32768 : i16[i] / 32767;
-      return f32;
-    }
-    if (packet.fmt === FMT_FLOAT32) return new Float32Array(packet.payload.slice(0));
-    return new Float32Array((peer.handshake && peer.handshake.channels || 2) * 480);
-  }
-
-  function _nearestPendingSeq(peer) {
-    let best = null;
-    for (const seq of peer.pendingAudio.keys()) {
-      if (_seqDistance(peer.expectedSeq, seq) >= 32768) continue;
-      if (best === null || _seqDistance(peer.expectedSeq, seq) < _seqDistance(peer.expectedSeq, best)) best = seq;
-    }
-    return best;
-  }
-
-  function _tryRepair(peer, missingSeq) {
-    const groupSize = (peer.handshake && peer.handshake.fecGroupSize) || FEC_GROUP_SIZE;
-    const base = _groupBase(missingSeq, groupSize);
-    const fec = peer.pendingFec.get(base);
-    if (!fec) return null;
-    let missingCount = 0;
-    const payload = fec.payload.slice(0);
-    for (let i = 0; i < groupSize; i++) {
-      const seq = (base + i) & 0xFFFF;
-      if (seq === missingSeq) { missingCount++; continue; }
-      const packet = peer.pendingAudio.get(seq) || peer.recentAudio.get(seq);
-      if (!packet) { missingCount++; continue; }
-      _xorInto(new Uint8Array(payload), new Uint8Array(packet.payload));
-    }
-    if (missingCount !== 1) return null;
-    peer.fecRepaired++;
-    return { seq: missingSeq, frames: fec.frames, fmt: fec.fmt, channels: fec.channels, payload, repaired: true };
-  }
-
-  function _postPacket(peer, packet, zeroFilled) {
-    const wn = _workletNodes.get(peer.pc);
-    if (!wn || _losslessDisabled) return;
-    const channels = packet.channels || (peer.handshake && peer.handshake.channels) || 2;
-    const f32 = zeroFilled ? new Float32Array(channels * 480) : _decodePacket(peer, packet);
-    wn.port.postMessage({ type: 'frame', samples: f32.buffer, channels }, [f32.buffer]);
-    if (!zeroFilled) {
-      peer.recentAudio.set(packet.seq, packet);
-      while (peer.recentAudio.size > 64) peer.recentAudio.delete(peer.recentAudio.keys().next().value);
-    }
-    peer.lastFrameMs = Date.now();
-    peer.frames++;
-    if (zeroFilled) peer.zeroFilled++;
-    if (peer.frames === 1 || peer.opusRestored) {
-      log('Lossless frame active - muting Opus');
-      peer.opusRestored = false;
-      _muteOpus(peer);
-      _updateOverlay();
-    }
-  }
-
-  function _flushPeer(peer) {
-    if (peer.expectedSeq === null) return;
-    let guard = 0;
-    while (guard++ < 256) {
-      const packet = peer.pendingAudio.get(peer.expectedSeq);
-      if (packet) {
-        peer.pendingAudio.delete(peer.expectedSeq);
-        _postPacket(peer, packet, false);
-        peer.expectedSeq = (peer.expectedSeq + 1) & 0xFFFF;
-        continue;
-      }
-      const repaired = _tryRepair(peer, peer.expectedSeq);
-      if (repaired) {
-        _postPacket(peer, repaired, false);
-        peer.expectedSeq = (peer.expectedSeq + 1) & 0xFFFF;
-        continue;
-      }
-      const nextSeq = _nearestPendingSeq(peer);
-      if (nextSeq === null) break;
-      const gap = _seqDistance(peer.expectedSeq, nextSeq);
-      if (gap > 0 && gap < FEC_GROUP_SIZE) break;
-      peer.underruns++;
-      peer.fecUnrepaired++;
-      _postPacket(peer, {
-        seq: peer.expectedSeq,
-        frames: 480,
-        fmt: FMT_FLOAT32,
-        channels: (peer.handshake && peer.handshake.channels) || 2,
-        payload: new ArrayBuffer(0),
-      }, true);
-      peer.expectedSeq = (peer.expectedSeq + 1) & 0xFFFF;
-    }
-  }
-
   async function _onDcMessage(peer, ev) {
     if (!peer.handshake) {
       try {
@@ -308,16 +178,18 @@
           ? ev.data
           : new TextDecoder().decode(ev.data instanceof ArrayBuffer ? ev.data : await ev.data.arrayBuffer());
         const hs = JSON.parse(text);
-        if (!hs.v || hs.v > PROTOCOL_VERSION) { warn(`Unknown handshake version ${hs.v}`); peer.dc.close(); return; }
+        if (hs.v !== 1) { warn(`Unknown handshake version ${hs.v}`); peer.dc.close(); return; }
         peer.handshake = hs;
         log(`Handshake: ${hs.sampleRate}Hz ${hs.channels}ch ${hs.format}`);
-        try { peer.dc.send(JSON.stringify({ v: PROTOCOL_VERSION, type: 'ack', lossless: true, viewer: VERSION })); } catch (_) {}
         await _ensureAudio(hs.sampleRate);
         await _buildWorkletNode(peer);
         _updateOverlay();
       } catch (e) { warn(`Bad handshake: ${e.message}`); peer.dc.close(); }
       return;
     }
+
+    const wn = _workletNodes.get(peer.pc);
+    if (!wn) return;
 
     let buf;
     if (ev.data instanceof ArrayBuffer)             buf = ev.data;
@@ -326,34 +198,33 @@
     if (buf.byteLength < 8) return;
 
     const view = new DataView(buf);
-    const seq = view.getUint16(0, true);
-    const frames = view.getUint16(2, true);
-    const fmt = view.getUint8(4);
-    const channels = view.getUint8(5);
-    const kind = view.getUint8(6);
-    const groupSize = view.getUint8(7) || FEC_GROUP_SIZE;
+    const seq  = view.getUint16(0, true);
+    const fmt  = view.getUint8(4);
+
+    if (peer.lastSeq >= 0) {
+      const exp = (peer.lastSeq + 1) & 0xFFFF;
+      if (seq !== exp) {
+        const gap = (seq - exp + 65536) & 0xFFFF;
+        peer.underruns += gap;
+        warn(`Gap: ${gap} frame(s) (seq ${peer.lastSeq} → ${seq})`);
+      }
+    }
+    peer.lastSeq = seq; peer.lastFrameMs = Date.now();
+    peer.frames++; peer.bytes += buf.byteLength;
+
     const payload = buf.slice(8);
-    if (fmt !== FMT_INT16 && fmt !== FMT_FLOAT32) return;
+    let f32;
+    if (fmt === FMT_INT16) {
+      const i16 = new Int16Array(payload);
+      f32 = new Float32Array(i16.length);
+      for (let i = 0; i < i16.length; i++) f32[i] = i16[i] < 0 ? i16[i] / 32768 : i16[i] / 32767;
+    } else if (fmt === FMT_FLOAT32) {
+      f32 = new Float32Array(payload.slice(0));
+    } else { return; }
 
-    if (kind === FRAME_KIND_FEC) {
-      peer.pendingFec.set(seq, { seq, frames, fmt, channels, groupSize, payload });
-      _flushPeer(peer);
-      _updateOverlay();
-      return;
-    }
-    if (kind !== FRAME_KIND_AUDIO) return;
+    wn.port.postMessage({ type: 'frame', samples: f32.buffer, channels: peer.handshake.channels }, [f32.buffer]);
 
-    if (peer.expectedSeq === null) peer.expectedSeq = seq;
-    else if (_seqDistance(peer.expectedSeq, seq) >= 32768) {
-      peer.lateFrames++;
-      return;
-    }
-    if (peer.lastSeq >= 0 && seq !== ((peer.lastSeq + 1) & 0xFFFF)) peer.lateFrames++;
-    peer.lastSeq = seq;
-    peer.bytes += buf.byteLength;
-    peer.pendingAudio.set(seq, { seq, frames, fmt, channels, groupSize, payload });
-    _flushPeer(peer);
-    _updateOverlay();
+    if (peer.frames === 1) { log('First DC frame — muting Opus'); _muteOpus(peer); _updateOverlay(); }
   }
 
   // -------------------------------------------------------------------------
@@ -435,35 +306,12 @@
 
     _overlay = document.createElement('div');
     _overlay.id = 'lossless-dc-status';
-    _overlay.setAttribute('role', 'region');
-    _overlay.setAttribute('aria-label', 'Lossless audio testing panel');
+    _overlay.setAttribute('aria-hidden', 'true');
     Object.assign(_overlay.style, {
       position: 'fixed', top: '8px', right: '8px', zIndex: '999999',
       background: 'rgba(0,0,0,0.80)', color: '#00ff88',
       font: '11px/1.6 monospace', padding: '6px 10px', borderRadius: '5px',
-      pointerEvents: 'auto', maxWidth: '320px', userSelect: 'none',
-    });
-    _overlay.addEventListener('click', (ev) => {
-      const action = ev.target && ev.target.getAttribute && ev.target.getAttribute('data-lossless-action');
-      if (action === 'disable') {
-        _losslessDisabled = true;
-        for (const [, peer] of _peers) {
-          peer.opusRestored = true;
-          if (peer.audioEl) peer.audioEl.volume = peer.savedVolume;
-        }
-        _updateOverlay();
-      } else if (action === 'retry') {
-        _losslessDisabled = false;
-        for (const [, peer] of _peers) {
-          peer.opusRestored = false;
-          peer.frames = 0;
-          peer.expectedSeq = null;
-          peer.pendingAudio.clear();
-          peer.pendingFec.clear();
-          peer.recentAudio.clear();
-        }
-        _updateOverlay();
-      }
+      pointerEvents: 'none', maxWidth: '260px', userSelect: 'none',
     });
     document.body.appendChild(_overlay);
   }
@@ -472,45 +320,34 @@
     _ensureOverlay();
     if (!_overlay) return;
     let totalFrames = 0, totalUnderruns = 0, totalBytes = 0, activePeers = 0;
-    let repaired = 0, unrepaired = 0, lateFrames = 0, zeroFilled = 0, bufferDepth = 0;
     const now = Date.now();
     for (const [, p] of _peers) {
       if (!p.handshake) continue;
       totalFrames    += p.frames;
       totalUnderruns += p.underruns;
       totalBytes     += p.bytes;
-      repaired       += p.fecRepaired;
-      unrepaired     += p.fecUnrepaired;
-      lateFrames     += p.lateFrames;
-      zeroFilled     += p.zeroFilled;
-      bufferDepth    += p.bufferDepth || 0;
-      if (!_losslessDisabled && p.lastFrameMs > 0 && (now - p.lastFrameMs) < FALLBACK_MS) activePeers++;
+      if (p.lastFrameMs > 0 && (now - p.lastFrameMs) < FALLBACK_MS) activePeers++;
     }
     const elapsed  = totalFrames * 0.01;
     const kbps     = elapsed > 0 ? Math.round((totalBytes * 8) / elapsed / 1000) : 0;
-    const stateStr = _losslessDisabled ? 'LOSSLESS DISABLED' : (activePeers > 0 ? 'LOSSLESS ACTIVE' : (_peers.size > 0 ? 'OPUS FALLBACK' : 'IDLE'));
+    const stateStr = activePeers > 0 ? 'LOSSLESS ACTIVE' : (_peers.size > 0 ? 'OPUS FALLBACK' : 'IDLE');
 
     if (_announcer && stateStr !== _lastStateStr) {
       _lastStateStr = stateStr;
       _announcer.textContent = `Lossless audio: ${stateStr}`;
     }
-    const statsHtml = _showStats
-      ? `<div aria-hidden="true">` +
-        `Protocol: ${PROTOCOL_VERSION}  Worklet: ${window.__LOSSLESS_WORKLET_VERSION || 'loading'}<br>` +
-        `Frames: ${totalFrames}  Drops: ${totalUnderruns}  Late: ${lateFrames}<br>` +
-        `FEC: ${repaired}/${unrepaired}  Zero: ${zeroFilled}<br>` +
-        `Buffer: ${Math.round(bufferDepth)}fr  Last: ${activePeers ? 'live' : 'idle'}<br>` +
-        `~${kbps} kbps` +
-        `</div>`
-      : '';
     _overlay.innerHTML =
-      `<b>Lossless DC ${VERSION}</b><br><span>${stateStr}</span><br>` +
-      `<button type="button" data-lossless-action="disable" style="margin:4px 4px 4px 0">Disable lossless</button>` +
-      `<button type="button" data-lossless-action="retry" style="margin:4px 0">Retry lossless</button>` +
-      statsHtml;
+      `<b>Lossless DC ${VERSION}</b><br>${stateStr}<br>` +
+      `Frames: ${totalFrames}  Drops: ${totalUnderruns}<br>~${kbps} kbps`;
   }
 
   setInterval(() => {
+    const now = Date.now();
+    for (const [, p] of _peers) {
+      if (!p.handshake || p.frames === 0) continue;
+      const age = now - p.lastFrameMs;
+      log(`stats: frames=${p.frames} underruns=${p.underruns} ~${Math.round((p.bytes * 8) / (p.frames * 0.01) / 1000)}kbps state=${age < FALLBACK_MS ? 'active' : 'silent'} lastFrame=${age}ms ago`);
+    }
     _updateOverlay();
   }, 1000);
 

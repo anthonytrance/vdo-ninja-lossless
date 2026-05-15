@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC Viewer v1.0.2
+ * VDO.Ninja Lossless DC Viewer v1.0.3
  *
  * Inject via:  &js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
  *
@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.2';
+  const VERSION     = '1.0.3';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
@@ -51,8 +51,12 @@
     return { pc, dc, stream: null, handshake: null, audioEl: null,
              savedVolume: 1.0, gainNode: null,
              lastFrameMs: 0, lastSeq: -1,
-             frames: 0, underruns: 0, bytes: 0, opusRestored: false };
+             frames: 0, underruns: 0, bytes: 0, opusRestored: false,
+             pollTimer: null };
   }
+
+  // Global state — manual fallback / retry are page-wide, not per-peer
+  let _userDisabled = false;
 
   // -------------------------------------------------------------------------
   // AudioContext + AudioWorklet (shared)
@@ -132,6 +136,7 @@
   }
 
   function _muteOpus(peer) {
+    if (_userDisabled) return;
     if (peer.audioEl) return;
     const el = _findAudioElement(peer);
     if (!el) { warn('Opus audio element not found — both streams may play simultaneously'); return; }
@@ -146,15 +151,36 @@
   function _restoreOpus(peer) {
     if (peer.opusRestored) return;
     peer.opusRestored = true;
-    if (peer.audioEl) { peer.audioEl.volume = peer.savedVolume; log('Opus restored'); }
+
+    // The cached audioEl reference may be stale (VDO.Ninja can replace the
+    // element when it re-attaches a stream). Re-find it from peer.stream if
+    // the cached one is no longer in the document. Then clear `muted` and
+    // call play() defensively — restoring volume alone is not enough if the
+    // element ended up paused or muted while lossless had the foreground.
+    let el = peer.audioEl;
+    if (!el || !document.contains(el)) {
+      const found = _findAudioElement(peer);
+      if (found) { el = found; peer.audioEl = found; }
+    }
+    if (el) {
+      try { if (el.muted) el.muted = false; } catch (_) {}
+      try { el.volume = peer.savedVolume > 0 ? peer.savedVolume : 1.0; } catch (_) {}
+      if (el.paused) { try { el.play().catch(() => {}); } catch (_) {} }
+      log(`Opus restored (vol=${el.volume.toFixed(2)} muted=${el.muted} paused=${el.paused})`);
+    } else {
+      warn('Opus restore: no audio element found');
+    }
+
+    if (peer.pollTimer) { clearInterval(peer.pollTimer); peer.pollTimer = null; }
     const wn = _workletNodes.get(peer.pc);
     if (wn)          { try { wn.disconnect();          } catch (_) {} _workletNodes.delete(peer.pc); }
     if (peer.gainNode) { try { peer.gainNode.disconnect(); } catch (_) {} peer.gainNode = null; }
   }
 
   function _startVolumePoll(peer) {
-    const t = setInterval(() => {
-      if (!peer.audioEl || !peer.gainNode) { clearInterval(t); return; }
+    if (peer.pollTimer) clearInterval(peer.pollTimer);
+    peer.pollTimer = setInterval(() => {
+      if (!peer.audioEl || !peer.gainNode) { clearInterval(peer.pollTimer); peer.pollTimer = null; return; }
       const v = peer.audioEl.volume;
       if (v !== 0) {
         peer.savedVolume = v;
@@ -163,7 +189,7 @@
       }
       if (peer.lastFrameMs > 0 && Date.now() - peer.lastFrameMs > FALLBACK_MS) {
         warn('DC silent — Opus fallback');
-        _restoreOpus(peer); _updateOverlay(); clearInterval(t);
+        _restoreOpus(peer); _updateOverlay();
       }
     }, 250);
   }
@@ -181,6 +207,11 @@
         if (hs.v !== 1) { warn(`Unknown handshake version ${hs.v}`); peer.dc.close(); return; }
         peer.handshake = hs;
         log(`Handshake: ${hs.sampleRate}Hz ${hs.channels}ch ${hs.format}`);
+        if (_userDisabled) {
+          log('User disabled lossless — handshake parsed but worklet not built');
+          _updateOverlay();
+          return;
+        }
         await _ensureAudio(hs.sampleRate);
         await _buildWorkletNode(peer);
         _updateOverlay();
@@ -288,11 +319,22 @@
   log('RTCPeerConnection prototype patched — lossless DC ready');
 
   // -------------------------------------------------------------------------
-  // Overlay (visual, aria-hidden) + hidden aria-live announcer (state changes only)
+  // Overlay — keyboard-accessible status panel + persistent Disable/Retry buttons.
+  // The overlay is part of the a11y tree so screen-reader users can tab to it
+  // and read the stats. A hidden aria-live region also announces state-change
+  // transitions ("Lossless audio: ACTIVE / OPUS FALLBACK / DISABLED").
+  //
+  // Buttons are real DOM nodes created once with direct click listeners. We
+  // never replace them via innerHTML — only text nodes update each tick —
+  // so screen-reader focus on a button survives stat refreshes.
   // -------------------------------------------------------------------------
   let _overlay      = null;
   let _announcer    = null;
   let _lastStateStr = '';
+  let _stateNode    = null;
+  let _statsNode    = null;
+  let _disableBtn   = null;
+  let _retryBtn     = null;
 
   function _ensureOverlay() {
     if (_overlay) return;
@@ -306,39 +348,122 @@
 
     _overlay = document.createElement('div');
     _overlay.id = 'lossless-dc-status';
-    _overlay.setAttribute('aria-hidden', 'true');
+    _overlay.setAttribute('role', 'region');
+    _overlay.setAttribute('aria-label', 'Lossless audio status');
+    _overlay.setAttribute('tabindex', '0');
     Object.assign(_overlay.style, {
       position: 'fixed', top: '8px', right: '8px', zIndex: '999999',
       background: 'rgba(0,0,0,0.80)', color: '#00ff88',
       font: '11px/1.6 monospace', padding: '6px 10px', borderRadius: '5px',
-      pointerEvents: 'none', maxWidth: '260px', userSelect: 'none',
+      pointerEvents: 'auto', maxWidth: '320px', userSelect: 'text',
     });
+
+    const title = document.createElement('div');
+    title.innerHTML = `<b>Lossless DC ${VERSION}</b>`;
+    _overlay.appendChild(title);
+
+    _stateNode = document.createElement('div');
+    _stateNode.textContent = 'IDLE';
+    _overlay.appendChild(_stateNode);
+
+    _statsNode = document.createElement('div');
+    _statsNode.textContent = 'Frames: 0  Drops: 0  ~0 kbps';
+    _overlay.appendChild(_statsNode);
+
+    const btnRow = document.createElement('div');
+    btnRow.style.marginTop = '4px';
+
+    _disableBtn = document.createElement('button');
+    _disableBtn.type = 'button';
+    _disableBtn.textContent = 'Disable lossless';
+    _disableBtn.setAttribute('aria-label', 'Disable lossless audio and force Opus');
+    _disableBtn.style.marginRight = '4px';
+    _disableBtn.addEventListener('click', _onDisableClick);
+
+    _retryBtn = document.createElement('button');
+    _retryBtn.type = 'button';
+    _retryBtn.textContent = 'Retry lossless';
+    _retryBtn.setAttribute('aria-label', 'Retry lossless audio after fallback');
+    _retryBtn.addEventListener('click', _onRetryClick);
+
+    btnRow.appendChild(_disableBtn);
+    btnRow.appendChild(_retryBtn);
+    _overlay.appendChild(btnRow);
+
     document.body.appendChild(_overlay);
+  }
+
+  function _computeStateStr() {
+    if (_userDisabled) return 'LOSSLESS DISABLED';
+    let activePeers = 0;
+    const now = Date.now();
+    for (const [, p] of _peers) {
+      if (!p.handshake) continue;
+      if (p.lastFrameMs > 0 && (now - p.lastFrameMs) < FALLBACK_MS && !p.opusRestored) activePeers++;
+    }
+    if (activePeers > 0) return 'LOSSLESS ACTIVE';
+    if (_peers.size > 0) return 'OPUS FALLBACK';
+    return 'IDLE';
   }
 
   function _updateOverlay() {
     _ensureOverlay();
     if (!_overlay) return;
-    let totalFrames = 0, totalUnderruns = 0, totalBytes = 0, activePeers = 0;
-    const now = Date.now();
+    let totalFrames = 0, totalUnderruns = 0, totalBytes = 0;
     for (const [, p] of _peers) {
       if (!p.handshake) continue;
       totalFrames    += p.frames;
       totalUnderruns += p.underruns;
       totalBytes     += p.bytes;
-      if (p.lastFrameMs > 0 && (now - p.lastFrameMs) < FALLBACK_MS) activePeers++;
     }
     const elapsed  = totalFrames * 0.01;
     const kbps     = elapsed > 0 ? Math.round((totalBytes * 8) / elapsed / 1000) : 0;
-    const stateStr = activePeers > 0 ? 'LOSSLESS ACTIVE' : (_peers.size > 0 ? 'OPUS FALLBACK' : 'IDLE');
+    const stateStr = _computeStateStr();
+
+    if (_stateNode) _stateNode.textContent = stateStr;
+    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  Drops: ${totalUnderruns}  ~${kbps} kbps`;
+
+    // Conditional visibility — Disable when lossless is playing, Retry when Opus is.
+    if (_disableBtn) {
+      const show = stateStr === 'LOSSLESS ACTIVE';
+      _disableBtn.style.display = show ? '' : 'none';
+      _disableBtn.setAttribute('aria-hidden', show ? 'false' : 'true');
+    }
+    if (_retryBtn) {
+      const show = stateStr === 'OPUS FALLBACK' || stateStr === 'LOSSLESS DISABLED';
+      _retryBtn.style.display = show ? '' : 'none';
+      _retryBtn.setAttribute('aria-hidden', show ? 'false' : 'true');
+    }
 
     if (_announcer && stateStr !== _lastStateStr) {
       _lastStateStr = stateStr;
       _announcer.textContent = `Lossless audio: ${stateStr}`;
     }
-    _overlay.innerHTML =
-      `<b>Lossless DC ${VERSION}</b><br>${stateStr}<br>` +
-      `Frames: ${totalFrames}  Drops: ${totalUnderruns}<br>~${kbps} kbps`;
+  }
+
+  function _onDisableClick() {
+    log('Disable lossless clicked');
+    _userDisabled = true;
+    for (const [, peer] of _peers) {
+      if (peer.handshake) _restoreOpus(peer);
+    }
+    _updateOverlay();
+  }
+
+  async function _onRetryClick() {
+    log('Retry lossless clicked');
+    _userDisabled = false;
+    for (const [, peer] of _peers) {
+      if (!peer.handshake) continue;
+      peer.opusRestored = false;
+      peer.frames = 0;
+      peer.lastFrameMs = 0;
+      peer.lastSeq = -1;
+      // Drop cached audio element ref so the next mute re-discovers it
+      peer.audioEl = null;
+      try { await _buildWorkletNode(peer); } catch (e) { warn(`retry rebuild failed: ${e.message}`); }
+    }
+    _updateOverlay();
   }
 
   setInterval(() => {

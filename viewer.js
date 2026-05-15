@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC Viewer v1.0.0
+ * VDO.Ninja Lossless DC Viewer v1.0.1
  *
  * Inject via:  &js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
  *
@@ -11,16 +11,17 @@
  *   - Mutes the VDO.Ninja Opus <audio> element for that peer once DC frames arrive.
  *   - Falls back to Opus automatically if DC goes silent for 2 seconds.
  *   - Logs stats to console every second and shows a small status overlay.
- *     The overlay is an aria-live region so screen readers announce state changes.
+ *   - Screen reader: a separate hidden aria-live region announces only on
+ *     state changes (IDLE → LOSSLESS ACTIVE, etc.), not every stats tick.
  */
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.0';
+  const VERSION     = '1.0.1';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
-  const FALLBACK_MS = 2000; // fall back to Opus if DC silent for this long
+  const FALLBACK_MS = 2000;
   const FMT_INT16   = 0;
   const FMT_FLOAT32 = 1;
 
@@ -49,17 +50,16 @@
   }
 
   // -------------------------------------------------------------------------
-  // Per-PC state: dc, stream, handshake, audio routing, stats
+  // Per-PC state
   // -------------------------------------------------------------------------
-  // Map<RTCPeerConnection, PeerState>
   const _peers = new Map();
 
   function _newPeer(pc, dc) {
     return {
       pc, dc,
-      stream:       null,   // remote MediaStream (from ontrack)
-      handshake:    null,   // parsed JSON handshake from publisher
-      audioEl:      null,   // the <audio> element we muted
+      stream:       null,
+      handshake:    null,
+      audioEl:      null,
       savedVolume:  1.0,
       gainNode:     null,
       lastFrameMs:  0,
@@ -78,16 +78,29 @@
   let _workletLoaded = false;
   let _workletLoading = false;
 
-  // Map<RTCPeerConnection, AudioWorkletNode>
   const _workletNodes = new Map();
+
+  // Resume AudioContext on any user gesture — browsers require a gesture before
+  // audio can play, and VDO.Ninja may create the AudioContext before one happens.
+  function _resumeCtxOnGesture() {
+    if (_audioCtx && _audioCtx.state === 'suspended') {
+      _audioCtx.resume().catch(() => {});
+    }
+  }
+  ['click', 'keydown', 'touchstart', 'pointerdown'].forEach(evt =>
+    document.addEventListener(evt, _resumeCtxOnGesture, { capture: true, passive: true })
+  );
 
   async function _ensureAudio(sampleRate) {
     if (!_audioCtx) {
       _audioCtx = new AudioContext({ sampleRate: sampleRate || 48000 });
-      log(`AudioContext created @ ${_audioCtx.sampleRate} Hz`);
+      log(`AudioContext created @ ${_audioCtx.sampleRate} Hz (state: ${_audioCtx.state})`);
     }
     if (_audioCtx.state === 'suspended') {
       try { await _audioCtx.resume(); } catch (_) {}
+      if (_audioCtx.state === 'suspended') {
+        log('AudioContext still suspended — waiting for user gesture');
+      }
     }
     if (!_workletLoaded && !_workletLoading) {
       _workletLoading = true;
@@ -96,6 +109,7 @@
       try {
         await _audioCtx.audioWorklet.addModule(url);
         _workletLoaded = true;
+        _workletLoading = false;
         log('AudioWorklet module loaded');
       } catch (e) {
         warn(`AudioWorklet load failed: ${e.message}`);
@@ -103,7 +117,6 @@
         throw e;
       }
     }
-    // Busy-wait if still loading (concurrent handshakes from multiple peers)
     while (_workletLoading && !_workletLoaded) {
       await new Promise(r => setTimeout(r, 50));
     }
@@ -113,18 +126,15 @@
     if (!_workletLoaded) throw new Error('worklet not loaded');
     const channels = peer.handshake.channels || 2;
     const wn = new AudioWorkletNode(_audioCtx, 'lossless-audio-processor', {
-      numberOfInputs:    0,
-      numberOfOutputs:   1,
+      numberOfInputs:     0,
+      numberOfOutputs:    1,
       outputChannelCount: [channels],
-      processorOptions:  { channels },
+      processorOptions:   { channels },
     });
     wn.port.onmessage = (ev) => {
       if (ev.data.type === 'underrun') {
         peer.underruns++;
-        warn(`Worklet underrun #${peer.underruns} (total worklet-side)`);
         _updateOverlay();
-      } else if (ev.data.type === 'stats') {
-        // periodic stats from worklet (optional)
       }
     };
     peer.gainNode = _audioCtx.createGain();
@@ -136,7 +146,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // Opus audio element muting / restore
+  // Opus muting / restore
   // -------------------------------------------------------------------------
   function _findAudioElement(peer) {
     if (!peer.stream) return null;
@@ -144,7 +154,6 @@
     for (const el of elements) {
       if (el.srcObject === peer.stream) return el;
     }
-    // Fallback: match by track ID overlap (VDO.Ninja may wrap streams)
     const ourIds = new Set(peer.stream.getTracks().map(t => t.id));
     for (const el of elements) {
       if (el.srcObject instanceof MediaStream) {
@@ -158,9 +167,9 @@
     if (peer.audioEl) return;
     const el = _findAudioElement(peer);
     if (el) {
-      peer.audioEl      = el;
-      peer.savedVolume  = el.volume > 0 ? el.volume : 1.0;
-      el.volume         = 0;
+      peer.audioEl     = el;
+      peer.savedVolume = el.volume > 0 ? el.volume : 1.0;
+      el.volume        = 0;
       if (peer.gainNode) peer.gainNode.gain.value = peer.savedVolume;
       log(`Opus muted — element: ${el.id || el.tagName}, saved volume=${peer.savedVolume.toFixed(2)}`);
       _startVolumePoll(peer);
@@ -182,25 +191,15 @@
   }
 
   function _startVolumePoll(peer) {
-    // Poll VDO.Ninja's volume changes every 250 ms and mirror to our GainNode.
-    // VDO.Ninja sets .volume directly without consistent events.
     const timer = setInterval(() => {
       if (!peer.audioEl || !peer.gainNode) { clearInterval(timer); return; }
-
-      // Track VDO.Ninja's intended volume via the element's current volume
-      // (we keep ours at 0 while DC is active, but save changes for restore)
       const elVol = peer.audioEl.volume;
       if (elVol !== 0) {
-        // VDO.Ninja changed it back — update our saved volume and re-mute
         peer.savedVolume = elVol;
         peer.gainNode.gain.value = elVol;
         const dcAge = Date.now() - peer.lastFrameMs;
-        if (dcAge < FALLBACK_MS) {
-          peer.audioEl.volume = 0; // keep Opus muted while DC is active
-        }
+        if (dcAge < FALLBACK_MS) peer.audioEl.volume = 0;
       }
-
-      // Check for DC fallback
       if (peer.lastFrameMs > 0 && (Date.now() - peer.lastFrameMs) > FALLBACK_MS) {
         warn(`DC silent ${FALLBACK_MS}ms — falling back to Opus`);
         _restoreOpus(peer);
@@ -214,7 +213,6 @@
   // DC message handler
   // -------------------------------------------------------------------------
   async function _onDcMessage(peer, ev) {
-    // First message = JSON handshake
     if (!peer.handshake) {
       try {
         const text = typeof ev.data === 'string'
@@ -234,7 +232,6 @@
       return;
     }
 
-    // Subsequent messages = binary audio frames
     const wn = _workletNodes.get(peer.pc);
     if (!wn) return;
 
@@ -249,10 +246,9 @@
     if (buf.byteLength < 8) return;
 
     const view = new DataView(buf);
-    const seq      = view.getUint16(0, true);
-    const fmt      = view.getUint8(4);
+    const seq  = view.getUint16(0, true);
+    const fmt  = view.getUint8(4);
 
-    // Gap / underrun detection
     if (peer.lastSeq >= 0) {
       const expected = (peer.lastSeq + 1) & 0xFFFF;
       if (seq !== expected) {
@@ -266,7 +262,6 @@
     peer.frames++;
     peer.bytes += buf.byteLength;
 
-    // Decode payload to Float32
     const payload = buf.slice(8);
     let f32;
     if (fmt === FMT_INT16) {
@@ -281,13 +276,12 @@
       return;
     }
 
-    // Transfer to worklet (zero-copy)
     wn.port.postMessage({ type: 'frame', samples: f32.buffer, channels: peer.handshake.channels }, [f32.buffer]);
 
-    // Mute Opus on first real frame
     if (peer.frames === 1) {
       log('First DC frame received — muting Opus');
       _muteOpus(peer);
+      _updateOverlay();
     }
   }
 
@@ -299,7 +293,6 @@
   function _PatchedPC(...args) {
     const pc = new _OrigPC(...args);
 
-    // Create the negotiated DC immediately (before any offer/answer)
     const dc = pc.createDataChannel(DC_LABEL, {
       id:             DC_ID,
       negotiated:     true,
@@ -311,7 +304,6 @@
     const peer = _newPeer(pc, dc);
     _peers.set(pc, peer);
 
-    // Capture remote stream for audio-element matching
     pc.addEventListener('track', (ev) => {
       if (ev.streams && ev.streams[0]) {
         peer.stream = ev.streams[0];
@@ -342,7 +334,6 @@
     return pc;
   }
 
-  // Preserve static properties and prototype chain
   Object.setPrototypeOf(_PatchedPC, _OrigPC);
   _PatchedPC.prototype = _OrigPC.prototype;
   try { window.RTCPeerConnection = _PatchedPC; } catch (_) {}
@@ -350,31 +341,47 @@
   log('RTCPeerConnection patched — lossless DC ready');
 
   // -------------------------------------------------------------------------
-  // Stats overlay (screen-reader friendly, aria-live)
+  // Overlay (visual, aria-hidden) + separate hidden announcer (aria-live)
+  // Screen reader only hears state transitions, not every stats tick.
   // -------------------------------------------------------------------------
-  let _overlay = null;
+  let _overlay   = null;
+  let _announcer = null;
+  let _lastStateStr = '';
 
   function _ensureOverlay() {
     if (_overlay) return;
     if (!document.body) return;
+
+    // Hidden aria-live region: announces only on state change
+    _announcer = document.createElement('div');
+    _announcer.setAttribute('aria-live', 'polite');
+    _announcer.setAttribute('role', 'status');
+    Object.assign(_announcer.style, {
+      position: 'absolute',
+      left:     '-9999px',
+      width:    '1px',
+      height:   '1px',
+      overflow: 'hidden',
+    });
+    document.body.appendChild(_announcer);
+
+    // Visual overlay: aria-hidden so screen readers skip the stats chatter
     _overlay = document.createElement('div');
     _overlay.id = 'lossless-dc-status';
-    _overlay.setAttribute('aria-live', 'polite');
-    _overlay.setAttribute('role', 'status');
-    _overlay.setAttribute('aria-label', 'Lossless audio status');
+    _overlay.setAttribute('aria-hidden', 'true');
     Object.assign(_overlay.style, {
-      position:        'fixed',
-      top:             '8px',
-      right:           '8px',
-      zIndex:          '999999',
-      background:      'rgba(0,0,0,0.80)',
-      color:           '#00ff88',
-      font:            '11px/1.6 monospace',
-      padding:         '6px 10px',
-      borderRadius:    '5px',
-      pointerEvents:   'none',
-      maxWidth:        '260px',
-      userSelect:      'none',
+      position:      'fixed',
+      top:           '8px',
+      right:         '8px',
+      zIndex:        '999999',
+      background:    'rgba(0,0,0,0.80)',
+      color:         '#00ff88',
+      font:          '11px/1.6 monospace',
+      padding:       '6px 10px',
+      borderRadius:  '5px',
+      pointerEvents: 'none',
+      maxWidth:      '260px',
+      userSelect:    'none',
     });
     document.body.appendChild(_overlay);
   }
@@ -395,12 +402,19 @@
       if (p.lastFrameMs > 0 && (now - p.lastFrameMs) < FALLBACK_MS) activePeers++;
     }
 
-    const elapsed  = totalFrames * 0.01; // seconds (each frame = 10ms)
+    const elapsed  = totalFrames * 0.01;
     const kbps     = elapsed > 0 ? Math.round((totalBytes * 8) / elapsed / 1000) : 0;
     const stateStr = activePeers > 0
       ? 'LOSSLESS ACTIVE'
       : (_peers.size > 0 ? 'OPUS FALLBACK' : 'IDLE');
 
+    // Announce to screen reader only when state changes
+    if (_announcer && stateStr !== _lastStateStr) {
+      _lastStateStr = stateStr;
+      _announcer.textContent = `Lossless audio: ${stateStr}`;
+    }
+
+    // Update visual overlay (aria-hidden, so no screen reader chatter)
     _overlay.innerHTML =
       `<b>Lossless DC ${VERSION}</b><br>` +
       `${stateStr}<br>` +
@@ -415,16 +429,15 @@
     const now = Date.now();
     for (const [, p] of _peers) {
       if (!p.handshake || p.frames === 0) continue;
-      const dcAge = now - p.lastFrameMs;
-      const state = dcAge < FALLBACK_MS ? 'active' : 'silent';
+      const dcAge  = now - p.lastFrameMs;
+      const state  = dcAge < FALLBACK_MS ? 'active' : 'silent';
       const elapsed = p.frames * 0.01;
-      const kbps = elapsed > 0 ? Math.round((p.bytes * 8) / elapsed / 1000) : 0;
+      const kbps   = elapsed > 0 ? Math.round((p.bytes * 8) / elapsed / 1000) : 0;
       log(`stats: frames=${p.frames} underruns=${p.underruns} ~${kbps}kbps state=${state} lastFrame=${dcAge}ms ago`);
     }
     _updateOverlay();
   }, 1000);
 
-  // Initial overlay once DOM is ready
   if (document.body) {
     _ensureOverlay();
     _updateOverlay();
@@ -432,6 +445,6 @@
     document.addEventListener('DOMContentLoaded', () => { _ensureOverlay(); _updateOverlay(); });
   }
 
-  log(`Loaded — inject URL includes &js= for ${DC_LABEL}`);
+  log(`Loaded v${VERSION} — waiting for DC`);
 
 })();

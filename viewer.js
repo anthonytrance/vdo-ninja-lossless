@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC Viewer v1.0.11
+ * VDO.Ninja Lossless DC Viewer v1.0.12
  *
  * Inject via:  &js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
  *
@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.11';
+  const VERSION     = '1.0.12';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
@@ -60,17 +60,17 @@
   // Worklet URL resolution
   // -------------------------------------------------------------------------
   function _getWorkletUrl() {
-    const workletFile = `audio-worklet-${VERSION}.js`;
+    const workletFile = `audio-worklet.js?v=${encodeURIComponent(VERSION)}`;
     try {
       const params = new URLSearchParams(window.location.search);
       for (const [, val] of params) {
-        if (val && /viewer(?:-[^/?#]+)?\.js/.test(val)) {
-          return val.replace(/viewer(?:-[^/?#]+)?\.js(\?.*)?$/, workletFile);
+        if (val && val.includes('viewer.js')) {
+          return val.replace(/viewer\.js(\?.*)?$/, workletFile);
         }
       }
     } catch (_) {}
     if (document.currentScript && document.currentScript.src) {
-      return document.currentScript.src.replace(/viewer(?:-[^/?#]+)?\.js(\?.*)?$/, workletFile);
+      return document.currentScript.src.replace(/viewer\.js(\?.*)?$/, workletFile);
     }
     return 'https://anthonytrance.github.io/vdo-ninja-lossless/audio-worklet.js';
   }

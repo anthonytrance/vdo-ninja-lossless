@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.6';
+  const VERSION     = '1.0.7';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
@@ -49,7 +49,7 @@
   const _peers = new Map();   // WeakMap would be cleaner but Map is fine here
 
   function _newPeer(pc, dc) {
-    return { pc, dc, stream: null, handshake: null, audioEl: null,
+    return { pc, dc, stream: null, handshake: null, ackSent: false, audioEl: null,
              savedVolume: 1.0, gainNode: null,
              lastFrameMs: 0, lastSeq: -1,
              frames: 0, underruns: 0, bytes: 0, opusRestored: false,
@@ -119,6 +119,15 @@
     peer.gainNode.connect(_audioCtx.destination);
     _workletNodes.set(peer.pc, wn);
     log(`AudioWorkletNode created (${channels}ch)`);
+  }
+
+  function _sendLosslessAck(peer) {
+    if (peer.ackSent || !peer.handshake || peer.handshake.v < 2) return;
+    try {
+      peer.dc.send(JSON.stringify({ v: 2, type: 'ack', lossless: true }));
+      peer.ackSent = true;
+      log('Ack sent to publisher');
+    } catch (_) {}
   }
 
   // -------------------------------------------------------------------------
@@ -208,11 +217,6 @@
           : new TextDecoder().decode(ev.data instanceof ArrayBuffer ? ev.data : await ev.data.arrayBuffer());
         const hs = JSON.parse(text);
         if (hs.v < 1 || hs.v > 2) { warn(`Unknown handshake version ${hs.v}`); peer.dc.close(); return; }
-        // v2: acknowledge receipt so publisher knows we'll accept lossless PCM
-        if (hs.v >= 2) {
-          try { peer.dc.send(JSON.stringify({ v: 2, type: 'ack', lossless: true })); } catch (_) {}
-          log('Ack sent to publisher');
-        }
         peer.handshake = hs;
         log(`Handshake v${hs.v}: ${hs.sampleRate}Hz ${hs.channels}ch ${hs.format}`);
         if (_userDisabled) {
@@ -222,6 +226,7 @@
         }
         await _ensureAudio(hs.sampleRate);
         await _buildWorkletNode(peer);
+        _sendLosslessAck(peer);
         _updateOverlay();
       } catch (e) { warn(`Bad handshake: ${e.message}`); peer.dc.close(); }
       return;
@@ -481,7 +486,11 @@
       peer.armed = false;
       // Drop cached audio element ref so the next mute re-discovers it
       peer.audioEl = null;
-      try { await _buildWorkletNode(peer); } catch (e) { warn(`retry rebuild failed: ${e.message}`); }
+      try {
+        await _ensureAudio(peer.handshake.sampleRate);
+        await _buildWorkletNode(peer);
+        _sendLosslessAck(peer);
+      } catch (e) { warn(`retry rebuild failed: ${e.message}`); }
     }
     _updateOverlay();
   }

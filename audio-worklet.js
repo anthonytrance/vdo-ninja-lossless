@@ -1,18 +1,23 @@
 /**
- * VDO.Ninja Lossless DC AudioWorklet Processor v1.0.0
+ * VDO.Ninja Lossless DC AudioWorklet Processor v1.0.6
  *
  * Registered as: 'lossless-audio-processor'
  * Loaded by viewer.js via AudioContext.audioWorklet.addModule()
  *
  * Protocol:
- *   main → worklet:  { type: 'frame', samples: Float32Array.buffer, channels: N }
- *   worklet → main:  { type: 'underrun' }
+ *   main -> worklet: { type: 'frame', samples: Float32Array.buffer, channels: N }
+ *   worklet -> main: { type: 'underrun' } | { type: 'arming', armed: bool }
  */
+const DEFAULT_ARMING_TARGET_FRAMES = 144;
+const REARM_UNDERRUN_TICKS = 8;
+
 class LosslessAudioProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super();
-    const ch = (options && options.processorOptions && options.processorOptions.channels) || 2;
+    const opts = (options && options.processorOptions) || {};
+    const ch = opts.channels || 2;
     this._channels = ch;
+    this._armingTargetFrames = Math.max(128, opts.armingTargetFrames || DEFAULT_ARMING_TARGET_FRAMES);
 
     // Ring buffer: 4096 frames per channel (at 48kHz = ~85ms of headroom)
     this._ringSize = 4096;
@@ -20,6 +25,8 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     this._writePos = 0;
     this._readPos  = 0;
     this._filled   = 0;  // samples per channel currently buffered
+    this._armed = false;
+    this._consecutiveUnderruns = 0;
 
     this.port.onmessage = (ev) => {
       if (ev.data.type === 'frame') {
@@ -35,7 +42,7 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     for (let f = 0; f < frames; f++) {
       const wp = (this._writePos + f) % this._ringSize;
       for (let c = 0; c < this._channels; c++) {
-        // If source has fewer channels than output, clamp to last available
+        // If source has fewer channels than output, clamp to last available.
         const sc = c < srcChannels ? c : srcChannels - 1;
         this._ring[c][wp] = interleaved[f * srcChannels + sc];
       }
@@ -44,14 +51,31 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     this._filled   = Math.min(this._filled + frames, this._ringSize);
   }
 
+  _setArmed(armed) {
+    if (this._armed === armed) return;
+    this._armed = armed;
+    this._consecutiveUnderruns = 0;
+    this.port.postMessage({ type: 'arming', armed });
+  }
+
   process(_inputs, outputs) {
     const output = outputs[0];
     const quantum = output[0] ? output[0].length : 128;
 
+    if (!this._armed) {
+      if (this._filled < this._armingTargetFrames) {
+        for (const ch of output) ch.fill(0);
+        return true;
+      }
+      this._setArmed(true);
+    }
+
     if (this._filled < quantum) {
-      // Not enough data — output silence, report underrun
+      // Not enough data after arming: output silence and report a real underrun.
       for (const ch of output) ch.fill(0);
       this.port.postMessage({ type: 'underrun' });
+      this._consecutiveUnderruns++;
+      if (this._consecutiveUnderruns >= REARM_UNDERRUN_TICKS) this._setArmed(false);
       return true;
     }
 
@@ -64,6 +88,7 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     }
     this._readPos = (this._readPos + quantum) % this._ringSize;
     this._filled -= quantum;
+    this._consecutiveUnderruns = 0;
     return true;
   }
 }

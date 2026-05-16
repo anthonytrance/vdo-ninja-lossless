@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC Viewer v1.0.4
+ * VDO.Ninja Lossless DC Viewer v1.0.6
  *
  * Inject via:  &js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
  *
@@ -13,13 +13,14 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.5';
+  const VERSION     = '1.0.6';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
   const FALLBACK_MS = 2000;
   const FMT_INT16   = 0;
   const FMT_FLOAT32 = 1;
+  const ARMING_TARGET_FRAMES = 144;
 
   function log(msg)  { console.log(`[lossless-dc v${VERSION}] ${msg}`); }
   function warn(msg) { console.warn(`[lossless-dc v${VERSION}] ${msg}`); }
@@ -52,7 +53,7 @@
              savedVolume: 1.0, gainNode: null,
              lastFrameMs: 0, lastSeq: -1,
              frames: 0, underruns: 0, bytes: 0, opusRestored: false,
-             pollTimer: null };
+             armed: false, pollTimer: null };
   }
 
   // Global state — manual fallback / retry are page-wide, not per-peer
@@ -106,10 +107,11 @@
     const wn = new AudioWorkletNode(_audioCtx, 'lossless-audio-processor', {
       numberOfInputs: 0, numberOfOutputs: 1,
       outputChannelCount: [channels],
-      processorOptions: { channels },
+      processorOptions: { channels, armingTargetFrames: ARMING_TARGET_FRAMES },
     });
     wn.port.onmessage = (ev) => {
       if (ev.data.type === 'underrun') { peer.underruns++; _updateOverlay(); }
+      if (ev.data.type === 'arming') { peer.armed = !!ev.data.armed; _updateOverlay(); }
     };
     peer.gainNode = _audioCtx.createGain();
     peer.gainNode.gain.value = peer.savedVolume;
@@ -175,6 +177,7 @@
     const wn = _workletNodes.get(peer.pc);
     if (wn)          { try { wn.disconnect();          } catch (_) {} _workletNodes.delete(peer.pc); }
     if (peer.gainNode) { try { peer.gainNode.disconnect(); } catch (_) {} peer.gainNode = null; }
+    peer.armed = false;
   }
 
   function _startVolumePoll(peer) {
@@ -372,7 +375,7 @@
     _overlay.appendChild(_stateNode);
 
     _statsNode = document.createElement('div');
-    _statsNode.textContent = 'Frames: 0  Drops: 0  ~0 kbps';
+    _statsNode.textContent = 'Frames: 0  Drops: 0  Buffer: 0/0 armed  ~0 kbps';
     _overlay.appendChild(_statsNode);
 
     const btnRow = document.createElement('div');
@@ -400,13 +403,16 @@
 
   function _computeStateStr() {
     if (_userDisabled) return 'LOSSLESS DISABLED';
-    let activePeers = 0;
+    let activePeers = 0, armedPeers = 0;
     const now = Date.now();
     for (const [, p] of _peers) {
       if (!p.handshake) continue;
-      if (p.lastFrameMs > 0 && (now - p.lastFrameMs) < FALLBACK_MS && !p.opusRestored) activePeers++;
+      if (p.lastFrameMs > 0 && (now - p.lastFrameMs) < FALLBACK_MS && !p.opusRestored) {
+        activePeers++;
+        if (p.armed) armedPeers++;
+      }
     }
-    if (activePeers > 0) return 'LOSSLESS ACTIVE';
+    if (activePeers > 0) return armedPeers > 0 ? 'LOSSLESS ACTIVE' : 'LOSSLESS BUFFERING';
     if (_peers.size > 0) return 'OPUS FALLBACK';
     return 'IDLE';
   }
@@ -414,23 +420,25 @@
   function _updateOverlay() {
     _ensureOverlay();
     if (!_overlay) return;
-    let totalFrames = 0, totalUnderruns = 0, totalBytes = 0;
+    let totalFrames = 0, totalUnderruns = 0, totalBytes = 0, armedCount = 0, losslessPeers = 0;
     for (const [, p] of _peers) {
       if (!p.handshake) continue;
       totalFrames    += p.frames;
       totalUnderruns += p.underruns;
       totalBytes     += p.bytes;
+      losslessPeers++;
+      if (p.armed) armedCount++;
     }
     const elapsed  = totalFrames * 0.01;
     const kbps     = elapsed > 0 ? Math.round((totalBytes * 8) / elapsed / 1000) : 0;
     const stateStr = _computeStateStr();
 
     if (_stateNode) _stateNode.textContent = stateStr;
-    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  Drops: ${totalUnderruns}  ~${kbps} kbps`;
+    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  Drops: ${totalUnderruns}  Buffer: ${armedCount}/${losslessPeers} armed  ~${kbps} kbps`;
 
     // Conditional visibility — Disable when lossless is playing, Retry when Opus is.
     if (_disableBtn) {
-      const show = stateStr === 'LOSSLESS ACTIVE';
+      const show = stateStr === 'LOSSLESS ACTIVE' || stateStr === 'LOSSLESS BUFFERING';
       _disableBtn.style.display = show ? '' : 'none';
       _disableBtn.setAttribute('aria-hidden', show ? 'false' : 'true');
     }
@@ -470,6 +478,7 @@
       peer.bytes = 0;
       peer.lastFrameMs = 0;
       peer.lastSeq = -1;
+      peer.armed = false;
       // Drop cached audio element ref so the next mute re-discovers it
       peer.audioEl = null;
       try { await _buildWorkletNode(peer); } catch (e) { warn(`retry rebuild failed: ${e.message}`); }

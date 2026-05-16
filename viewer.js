@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.4';
+  const VERSION     = '1.0.5';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
@@ -204,9 +204,14 @@
           ? ev.data
           : new TextDecoder().decode(ev.data instanceof ArrayBuffer ? ev.data : await ev.data.arrayBuffer());
         const hs = JSON.parse(text);
-        if (hs.v !== 1) { warn(`Unknown handshake version ${hs.v}`); peer.dc.close(); return; }
+        if (hs.v < 1 || hs.v > 2) { warn(`Unknown handshake version ${hs.v}`); peer.dc.close(); return; }
+        // v2: acknowledge receipt so publisher knows we'll accept lossless PCM
+        if (hs.v >= 2) {
+          try { peer.dc.send(JSON.stringify({ v: 2, type: 'ack', lossless: true })); } catch (_) {}
+          log('Ack sent to publisher');
+        }
         peer.handshake = hs;
-        log(`Handshake: ${hs.sampleRate}Hz ${hs.channels}ch ${hs.format}`);
+        log(`Handshake v${hs.v}: ${hs.sampleRate}Hz ${hs.channels}ch ${hs.format}`);
         if (_userDisabled) {
           log('User disabled lossless — handshake parsed but worklet not built');
           _updateOverlay();

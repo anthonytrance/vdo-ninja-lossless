@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC Viewer v1.0.14
+ * VDO.Ninja Lossless DC Viewer v1.0.16
  *
  * Inject via:  &js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
  *
@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.14';
+  const VERSION     = '1.0.16';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
@@ -22,8 +22,11 @@
   const FMT_FLOAT32 = 1;
   const PACKET_FRAMES = 480;
   const MAX_CONCEAL_PACKETS = 12;
-  const ARMING_TARGET_MS = _numberParam(['losslessBufferMs'], 12, 3, 100);
-  const ARMING_TARGET_FRAMES = Math.round(48000 * ARMING_TARGET_MS / 1000);
+  // losslessBufferMs is now the single target latency: the worklet arms at
+  // this fill level AND (once Step 6 lands) the drift integrator chases it.
+  // Default 30 ms — Layer A of the four-layer playout model.
+  const TARGET_BUFFER_MS = _numberParam(['losslessBufferMs'], 30, 5, 300);
+  const TARGET_BUFFER_FRAMES = Math.round(48000 * TARGET_BUFFER_MS / 1000);
   const STARTUP_PREROLL_PACKETS = Math.round(_numberParam(['losslessPreroll'], 2, 1, 10));
 
   function log(msg)  { console.log(`[lossless-dc v${VERSION}] ${msg}`); }
@@ -142,22 +145,25 @@
     const wn = new AudioWorkletNode(_audioCtx, 'lossless-audio-processor', {
       numberOfInputs: 0, numberOfOutputs: 1,
       outputChannelCount: [channels],
-      processorOptions: { channels, armingTargetFrames: ARMING_TARGET_FRAMES },
+      processorOptions: { channels, targetFrames: TARGET_BUFFER_FRAMES },
     });
+    peer.targetFrames = TARGET_BUFFER_FRAMES;
     wn.port.onmessage = (ev) => {
-      if (ev.data.type === 'underrun') {
+      const m = ev.data;
+      if (typeof m.target === 'number') peer.targetFrames = m.target;
+      if (m.type === 'underrun') {
         peer.audioUnderruns++;
-        peer.bufferFrames = ev.data.filled || 0;
+        peer.bufferFrames = m.filled || 0;
         _updateOverlay();
       }
-      if (ev.data.type === 'arming') {
-        peer.armed = !!ev.data.armed;
-        if (typeof ev.data.filled === 'number') peer.bufferFrames = ev.data.filled;
+      if (m.type === 'arming') {
+        peer.armed = !!m.armed;
+        if (typeof m.filled === 'number') peer.bufferFrames = m.filled;
         if (peer.armed && peer.losslessStarted) _muteOpus(peer);
         _updateOverlay();
       }
-      if (ev.data.type === 'buffer') {
-        peer.bufferFrames = ev.data.filled || 0;
+      if (m.type === 'buffer') {
+        peer.bufferFrames = m.filled || 0;
         _updateOverlay();
       }
     };
@@ -419,7 +425,7 @@
   };
 
   log('RTCPeerConnection prototype patched — lossless DC ready');
-  log(`Latency profile: losslessBufferMs=${ARMING_TARGET_MS} losslessPreroll=${STARTUP_PREROLL_PACKETS}`);
+  log(`Latency profile: losslessBufferMs=${TARGET_BUFFER_MS} (target=${TARGET_BUFFER_FRAMES} frames) losslessPreroll=${STARTUP_PREROLL_PACKETS}`);
 
   // -------------------------------------------------------------------------
   // Overlay — keyboard-accessible status panel + persistent Disable/Retry buttons.
@@ -516,7 +522,7 @@
     _ensureOverlay();
     if (!_overlay) return;
     let totalFrames = 0, totalSeqDrops = 0, totalAudioUnderruns = 0, totalConcealed = 0;
-    let totalBytes = 0, armedCount = 0, losslessPeers = 0, minBufferFrames = null;
+    let totalBytes = 0, armedCount = 0, losslessPeers = 0, minBufferFrames = null, maxTargetFrames = 0;
     for (const [, p] of _peers) {
       if (!p.handshake) continue;
       totalFrames    += p.frames;
@@ -527,6 +533,7 @@
       losslessPeers++;
       if (p.armed) armedCount++;
       if (p.bufferFrames > 0) minBufferFrames = minBufferFrames === null ? p.bufferFrames : Math.min(minBufferFrames, p.bufferFrames);
+      if (typeof p.targetFrames === 'number' && p.targetFrames > maxTargetFrames) maxTargetFrames = p.targetFrames;
     }
     const elapsed  = totalFrames * 0.01;
     const kbps     = elapsed > 0 ? Math.round((totalBytes * 8) / elapsed / 1000) : 0;
@@ -534,7 +541,8 @@
 
     if (_stateNode) _stateNode.textContent = stateStr;
     const bufMs = minBufferFrames === null ? 0 : Math.round((minBufferFrames / 48));
-    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  SeqDrops: ${totalSeqDrops}  AudioUnderruns: ${totalAudioUnderruns}  Conceal: ${totalConcealed}  Buffer: ${armedCount}/${losslessPeers} armed ${bufMs}ms  ~${kbps} kbps`;
+    const targetMs = maxTargetFrames > 0 ? Math.round(maxTargetFrames / 48) : TARGET_BUFFER_MS;
+    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  SeqDrops: ${totalSeqDrops}  AudioUnderruns: ${totalAudioUnderruns}  Conceal: ${totalConcealed}  Buffer: ${armedCount}/${losslessPeers} armed ${bufMs}ms / target ${targetMs}ms  ~${kbps} kbps`;
 
     // Conditional visibility — Disable when lossless is playing, Retry when Opus is.
     if (_disableBtn) {

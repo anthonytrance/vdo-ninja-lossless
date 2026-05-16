@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.7';
+  const VERSION     = '1.0.8';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
@@ -21,6 +21,7 @@
   const FMT_INT16   = 0;
   const FMT_FLOAT32 = 1;
   const ARMING_TARGET_FRAMES = 144;
+  const STARTUP_PREROLL_PACKETS = 6;
 
   function log(msg)  { console.log(`[lossless-dc v${VERSION}] ${msg}`); }
   function warn(msg) { console.warn(`[lossless-dc v${VERSION}] ${msg}`); }
@@ -53,7 +54,8 @@
              savedVolume: 1.0, gainNode: null,
              lastFrameMs: 0, lastSeq: -1,
              frames: 0, underruns: 0, bytes: 0, opusRestored: false,
-             armed: false, pollTimer: null };
+             armed: false, losslessStarted: false, startupQueue: [],
+             pollTimer: null };
   }
 
   // Global state — manual fallback / retry are page-wide, not per-peer
@@ -111,7 +113,11 @@
     });
     wn.port.onmessage = (ev) => {
       if (ev.data.type === 'underrun') { peer.underruns++; _updateOverlay(); }
-      if (ev.data.type === 'arming') { peer.armed = !!ev.data.armed; _updateOverlay(); }
+      if (ev.data.type === 'arming') {
+        peer.armed = !!ev.data.armed;
+        if (peer.armed && peer.losslessStarted) _muteOpus(peer);
+        _updateOverlay();
+      }
     };
     peer.gainNode = _audioCtx.createGain();
     peer.gainNode.gain.value = peer.savedVolume;
@@ -128,6 +134,14 @@
       peer.ackSent = true;
       log('Ack sent to publisher');
     } catch (_) {}
+  }
+
+  function _postFrameToWorklet(peer, f32, byteLength) {
+    const wn = _workletNodes.get(peer.pc);
+    if (!wn) return;
+    wn.port.postMessage({ type: 'frame', samples: f32.buffer, channels: peer.handshake.channels }, [f32.buffer]);
+    peer.frames++;
+    peer.bytes += byteLength;
   }
 
   // -------------------------------------------------------------------------
@@ -249,12 +263,16 @@
       const exp = (peer.lastSeq + 1) & 0xFFFF;
       if (seq !== exp) {
         const gap = (seq - exp + 65536) & 0xFFFF;
-        peer.underruns += gap;
-        warn(`Gap: ${gap} frame(s) (seq ${peer.lastSeq} → ${seq})`);
+        if (peer.losslessStarted) {
+          peer.underruns += gap;
+          warn(`Gap: ${gap} frame(s) (seq ${peer.lastSeq} → ${seq})`);
+        } else {
+          peer.startupQueue = [];
+          log(`Startup preroll gap: ${gap} frame(s) (seq ${peer.lastSeq} → ${seq}); waiting for clean preroll`);
+        }
       }
     }
     peer.lastSeq = seq; peer.lastFrameMs = Date.now();
-    peer.frames++; peer.bytes += buf.byteLength;
 
     const payload = buf.slice(8);
     let f32;
@@ -266,9 +284,22 @@
       f32 = new Float32Array(payload.slice(0));
     } else { return; }
 
-    wn.port.postMessage({ type: 'frame', samples: f32.buffer, channels: peer.handshake.channels }, [f32.buffer]);
+    if (!peer.losslessStarted) {
+      peer.startupQueue.push({ f32, byteLength: buf.byteLength });
+      if (peer.startupQueue.length < STARTUP_PREROLL_PACKETS) {
+        _updateOverlay();
+        return;
+      }
+      peer.losslessStarted = true;
+      log(`Startup preroll ready (${peer.startupQueue.length} packets) — lossless playback starts`);
+      for (const item of peer.startupQueue) _postFrameToWorklet(peer, item.f32, item.byteLength);
+      peer.startupQueue = [];
+      _updateOverlay();
+      return;
+    }
 
-    if (peer.frames === 1) { log('First DC frame — muting Opus'); _muteOpus(peer); _updateOverlay(); }
+    _postFrameToWorklet(peer, f32, buf.byteLength);
+    _updateOverlay();
   }
 
   // -------------------------------------------------------------------------
@@ -281,6 +312,7 @@
       dc = pc.createDataChannel(DC_LABEL, {
         id: DC_ID, negotiated: true, ordered: true, maxRetransmits: 0, protocol: DC_PROTOCOL,
       });
+      dc.binaryType = 'arraybuffer';
     } catch (e) {
       warn(`createDataChannel failed: ${e.message}`);
       return;
@@ -484,6 +516,8 @@
       peer.lastFrameMs = 0;
       peer.lastSeq = -1;
       peer.armed = false;
+      peer.losslessStarted = false;
+      peer.startupQueue = [];
       // Drop cached audio element ref so the next mute re-discovers it
       peer.audioEl = null;
       try {

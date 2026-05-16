@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC Viewer v1.0.3
+ * VDO.Ninja Lossless DC Viewer v1.0.4
  *
  * Inject via:  &js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
  *
@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.3';
+  const VERSION     = '1.0.4';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
@@ -456,7 +456,13 @@
     for (const [, peer] of _peers) {
       if (!peer.handshake) continue;
       peer.opusRestored = false;
+      // Reset ALL session counters together so the displayed stats stay
+      // consistent. Resetting frames but not underruns/bytes (v1.0.3) gave
+      // a ratio that looked impossible (more drops than frames, kbps far
+      // above the wire rate) once Retry was used.
       peer.frames = 0;
+      peer.underruns = 0;
+      peer.bytes = 0;
       peer.lastFrameMs = 0;
       peer.lastSeq = -1;
       // Drop cached audio element ref so the next mute re-discovers it

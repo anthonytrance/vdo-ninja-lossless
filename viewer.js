@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC Viewer v1.0.16
+ * VDO.Ninja Lossless DC Viewer v1.0.17
  *
  * Inject via:  &js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
  *
@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.16';
+  const VERSION     = '1.0.17';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';

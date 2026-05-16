@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC AudioWorklet Processor v1.0.13
+ * VDO.Ninja Lossless DC AudioWorklet Processor v1.0.14
  *
  * Registered as: 'lossless-audio-processor'
  * Loaded by viewer.js via AudioContext.audioWorklet.addModule()

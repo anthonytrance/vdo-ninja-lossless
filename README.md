@@ -4,30 +4,35 @@ Browser-side lossless audio receiver for VDO.Ninja, using RTCDataChannel and Aud
 
 ## Usage
 
-Inject into VDO.Ninja viewer URL:
+Inject into a VDO.Ninja viewer URL:
 
-```
+```text
 https://vdo.ninja/?room=YOURROOM&js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
 ```
 
+Optional low-latency tuning parameters are normal top-level VDO.Ninja URL parameters:
+
+```text
+&losslessBufferMs=8&losslessPreroll=1
+```
+
+Defaults: `losslessBufferMs=12`, `losslessPreroll=2`.
+
 ## Files
 
-- **viewer.js** — patches `RTCPeerConnection`, opens negotiated DC id=42, handles protocol v2 ack/FEC, mutes Opus while lossless is healthy, mirrors VDO.Ninja volume/mute, and shows the testing panel
-- **audio-worklet.js** — `AudioWorkletProcessor` ring buffer, loaded automatically by viewer.js, with buffer-depth/overrun/underrun stats
+- **viewer.js** - patches `RTCPeerConnection`, opens negotiated DC id=42, handles protocol v2 ack, mutes Opus while lossless is healthy, mirrors VDO.Ninja volume/mute, and shows the testing panel.
+- **audio-worklet.js** - `AudioWorkletProcessor` ring buffer, loaded automatically by `viewer.js`, with buffer-depth and underrun stats.
 
-## Status overlay
+## Status Overlay
 
-A small testing panel (top-right corner) shows:
+A small testing panel shows:
+
 - `LOSSLESS ACTIVE` / `OPUS FALLBACK` / `LOSSLESS DISABLED` / `IDLE`
 - Disable lossless and Retry lossless buttons
 - Viewer/worklet/protocol version
-- Frames, drops, late frames, FEC repaired/unrepaired, zero-filled frames, buffer depth, approximate kbps
+- Frames, sequence drops, AudioWorklet underruns, concealed frames, buffer depth, approximate kbps
 
 Screen readers receive state-change announcements only; stats are visual/testing-only and are not spammed through `aria-live`.
-
-## Stats
-
-Testing builds show visible stats by default. Add `losslessStats=0` or `losslessStats=false` to the URL to hide detailed stats.
 
 ## Fallback
 

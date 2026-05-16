@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC Viewer v1.0.13
+ * VDO.Ninja Lossless DC Viewer v1.0.14
  *
  * Inject via:  &js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
  *
@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.13';
+  const VERSION     = '1.0.14';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
@@ -22,9 +22,9 @@
   const FMT_FLOAT32 = 1;
   const PACKET_FRAMES = 480;
   const MAX_CONCEAL_PACKETS = 12;
-  const ARMING_TARGET_MS = _numberParam(['xnpLosslessBufferMs'], 12, 3, 100);
+  const ARMING_TARGET_MS = _numberParam(['losslessBufferMs'], 12, 3, 100);
   const ARMING_TARGET_FRAMES = Math.round(48000 * ARMING_TARGET_MS / 1000);
-  const STARTUP_PREROLL_PACKETS = Math.round(_numberParam(['xnpLosslessPreroll'], 2, 1, 10));
+  const STARTUP_PREROLL_PACKETS = Math.round(_numberParam(['losslessPreroll'], 2, 1, 10));
 
   function log(msg)  { console.log(`[lossless-dc v${VERSION}] ${msg}`); }
   function warn(msg) { console.warn(`[lossless-dc v${VERSION}] ${msg}`); }
@@ -419,7 +419,7 @@
   };
 
   log('RTCPeerConnection prototype patched — lossless DC ready');
-  log(`Latency profile: xnpLosslessBufferMs=${ARMING_TARGET_MS} xnpLosslessPreroll=${STARTUP_PREROLL_PACKETS}`);
+  log(`Latency profile: losslessBufferMs=${ARMING_TARGET_MS} losslessPreroll=${STARTUP_PREROLL_PACKETS}`);
 
   // -------------------------------------------------------------------------
   // Overlay — keyboard-accessible status panel + persistent Disable/Retry buttons.

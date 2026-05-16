@@ -13,15 +13,17 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.8';
+  const VERSION     = '1.0.9';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
   const FALLBACK_MS = 2000;
   const FMT_INT16   = 0;
   const FMT_FLOAT32 = 1;
-  const ARMING_TARGET_FRAMES = 144;
+  const ARMING_TARGET_FRAMES = 1440;
   const STARTUP_PREROLL_PACKETS = 6;
+  const PACKET_FRAMES = 480;
+  const MAX_CONCEAL_PACKETS = 12;
 
   function log(msg)  { console.log(`[lossless-dc v${VERSION}] ${msg}`); }
   function warn(msg) { console.warn(`[lossless-dc v${VERSION}] ${msg}`); }
@@ -53,7 +55,9 @@
     return { pc, dc, stream: null, handshake: null, ackSent: false, audioEl: null,
              savedVolume: 1.0, gainNode: null,
              lastFrameMs: 0, lastSeq: -1,
-             frames: 0, underruns: 0, bytes: 0, opusRestored: false,
+             frames: 0, seqDrops: 0, audioUnderruns: 0, concealed: 0,
+             bytes: 0, opusRestored: false, bufferFrames: 0,
+             lastGoodFrame: null,
              armed: false, losslessStarted: false, startupQueue: [],
              pollTimer: null };
   }
@@ -112,10 +116,19 @@
       processorOptions: { channels, armingTargetFrames: ARMING_TARGET_FRAMES },
     });
     wn.port.onmessage = (ev) => {
-      if (ev.data.type === 'underrun') { peer.underruns++; _updateOverlay(); }
+      if (ev.data.type === 'underrun') {
+        peer.audioUnderruns++;
+        peer.bufferFrames = ev.data.filled || 0;
+        _updateOverlay();
+      }
       if (ev.data.type === 'arming') {
         peer.armed = !!ev.data.armed;
+        if (typeof ev.data.filled === 'number') peer.bufferFrames = ev.data.filled;
         if (peer.armed && peer.losslessStarted) _muteOpus(peer);
+        _updateOverlay();
+      }
+      if (ev.data.type === 'buffer') {
+        peer.bufferFrames = ev.data.filled || 0;
         _updateOverlay();
       }
     };
@@ -139,9 +152,23 @@
   function _postFrameToWorklet(peer, f32, byteLength) {
     const wn = _workletNodes.get(peer.pc);
     if (!wn) return;
+    peer.lastGoodFrame = f32.slice(0);
     wn.port.postMessage({ type: 'frame', samples: f32.buffer, channels: peer.handshake.channels }, [f32.buffer]);
     peer.frames++;
     peer.bytes += byteLength;
+  }
+
+  function _concealGap(peer, gap) {
+    const count = Math.min(gap, MAX_CONCEAL_PACKETS);
+    const samplesPerPacket = PACKET_FRAMES * (peer.handshake.channels || 2);
+    for (let i = 0; i < count; i++) {
+      const f32 = peer.lastGoodFrame
+        ? new Float32Array(peer.lastGoodFrame)
+        : new Float32Array(samplesPerPacket);
+      _postFrameToWorklet(peer, f32, 0);
+      peer.concealed++;
+    }
+    if (gap > MAX_CONCEAL_PACKETS) warn(`Large DC gap: concealed ${MAX_CONCEAL_PACKETS}/${gap} packet(s), Opus fallback may be cleaner`);
   }
 
   // -------------------------------------------------------------------------
@@ -264,8 +291,9 @@
       if (seq !== exp) {
         const gap = (seq - exp + 65536) & 0xFFFF;
         if (peer.losslessStarted) {
-          peer.underruns += gap;
+          peer.seqDrops += gap;
           warn(`Gap: ${gap} frame(s) (seq ${peer.lastSeq} → ${seq})`);
+          _concealGap(peer, gap);
         } else {
           peer.startupQueue = [];
           log(`Startup preroll gap: ${gap} frame(s) (seq ${peer.lastSeq} → ${seq}); waiting for clean preroll`);
@@ -412,7 +440,7 @@
     _overlay.appendChild(_stateNode);
 
     _statsNode = document.createElement('div');
-    _statsNode.textContent = 'Frames: 0  Drops: 0  Buffer: 0/0 armed  ~0 kbps';
+    _statsNode.textContent = 'Frames: 0  SeqDrops: 0  AudioUnderruns: 0  Conceal: 0  Buffer: 0/0 armed 0ms  ~0 kbps';
     _overlay.appendChild(_statsNode);
 
     const btnRow = document.createElement('div');
@@ -457,21 +485,26 @@
   function _updateOverlay() {
     _ensureOverlay();
     if (!_overlay) return;
-    let totalFrames = 0, totalUnderruns = 0, totalBytes = 0, armedCount = 0, losslessPeers = 0;
+    let totalFrames = 0, totalSeqDrops = 0, totalAudioUnderruns = 0, totalConcealed = 0;
+    let totalBytes = 0, armedCount = 0, losslessPeers = 0, minBufferFrames = null;
     for (const [, p] of _peers) {
       if (!p.handshake) continue;
       totalFrames    += p.frames;
-      totalUnderruns += p.underruns;
+      totalSeqDrops  += p.seqDrops;
+      totalAudioUnderruns += p.audioUnderruns;
+      totalConcealed += p.concealed;
       totalBytes     += p.bytes;
       losslessPeers++;
       if (p.armed) armedCount++;
+      if (p.bufferFrames > 0) minBufferFrames = minBufferFrames === null ? p.bufferFrames : Math.min(minBufferFrames, p.bufferFrames);
     }
     const elapsed  = totalFrames * 0.01;
     const kbps     = elapsed > 0 ? Math.round((totalBytes * 8) / elapsed / 1000) : 0;
     const stateStr = _computeStateStr();
 
     if (_stateNode) _stateNode.textContent = stateStr;
-    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  Drops: ${totalUnderruns}  Buffer: ${armedCount}/${losslessPeers} armed  ~${kbps} kbps`;
+    const bufMs = minBufferFrames === null ? 0 : Math.round((minBufferFrames / 48));
+    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  SeqDrops: ${totalSeqDrops}  AudioUnderruns: ${totalAudioUnderruns}  Conceal: ${totalConcealed}  Buffer: ${armedCount}/${losslessPeers} armed ${bufMs}ms  ~${kbps} kbps`;
 
     // Conditional visibility — Disable when lossless is playing, Retry when Opus is.
     if (_disableBtn) {
@@ -511,13 +544,17 @@
       // a ratio that looked impossible (more drops than frames, kbps far
       // above the wire rate) once Retry was used.
       peer.frames = 0;
-      peer.underruns = 0;
+      peer.seqDrops = 0;
+      peer.audioUnderruns = 0;
+      peer.concealed = 0;
       peer.bytes = 0;
+      peer.bufferFrames = 0;
       peer.lastFrameMs = 0;
       peer.lastSeq = -1;
       peer.armed = false;
       peer.losslessStarted = false;
       peer.startupQueue = [];
+      peer.lastGoodFrame = null;
       // Drop cached audio element ref so the next mute re-discovers it
       peer.audioEl = null;
       try {
@@ -534,7 +571,7 @@
     for (const [, p] of _peers) {
       if (!p.handshake || p.frames === 0) continue;
       const age = now - p.lastFrameMs;
-      log(`stats: frames=${p.frames} underruns=${p.underruns} ~${Math.round((p.bytes * 8) / (p.frames * 0.01) / 1000)}kbps state=${age < FALLBACK_MS ? 'active' : 'silent'} lastFrame=${age}ms ago`);
+      log(`stats: frames=${p.frames} seqDrops=${p.seqDrops} audioUnderruns=${p.audioUnderruns} concealed=${p.concealed} buffer=${p.bufferFrames}f ~${Math.round((p.bytes * 8) / (p.frames * 0.01) / 1000)}kbps state=${age < FALLBACK_MS ? 'active' : 'silent'} lastFrame=${age}ms ago`);
     }
     _updateOverlay();
   }, 1000);

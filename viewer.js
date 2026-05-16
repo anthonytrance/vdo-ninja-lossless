@@ -13,20 +13,48 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.9';
+  const VERSION     = '1.0.10';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
   const FALLBACK_MS = 2000;
   const FMT_INT16   = 0;
   const FMT_FLOAT32 = 1;
-  const ARMING_TARGET_FRAMES = 1440;
-  const STARTUP_PREROLL_PACKETS = 6;
   const PACKET_FRAMES = 480;
   const MAX_CONCEAL_PACKETS = 12;
+  const ARMING_TARGET_MS = _numberParam(['llbuf', 'llbufms', 'losslessBufferMs'], 12, 3, 100);
+  const ARMING_TARGET_FRAMES = Math.round(48000 * ARMING_TARGET_MS / 1000);
+  const STARTUP_PREROLL_PACKETS = Math.round(_numberParam(['llpreroll', 'losslessPreroll'], 2, 1, 10));
 
   function log(msg)  { console.log(`[lossless-dc v${VERSION}] ${msg}`); }
   function warn(msg) { console.warn(`[lossless-dc v${VERSION}] ${msg}`); }
+
+  function _numberParam(names, fallback, min, max) {
+    const vals = [];
+    try {
+      const pageParams = new URLSearchParams(window.location.search);
+      for (const name of names) if (pageParams.has(name)) vals.push(pageParams.get(name));
+      for (const [, val] of pageParams) {
+        if (val && val.includes('viewer.js')) {
+          try {
+            const scriptUrl = new URL(val, window.location.href);
+            for (const name of names) if (scriptUrl.searchParams.has(name)) vals.push(scriptUrl.searchParams.get(name));
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    try {
+      if (document.currentScript && document.currentScript.src) {
+        const scriptUrl = new URL(document.currentScript.src, window.location.href);
+        for (const name of names) if (scriptUrl.searchParams.has(name)) vals.push(scriptUrl.searchParams.get(name));
+      }
+    } catch (_) {}
+    for (const val of vals) {
+      const n = Number(val);
+      if (Number.isFinite(n)) return Math.max(min, Math.min(max, n));
+    }
+    return fallback;
+  }
 
   // -------------------------------------------------------------------------
   // Worklet URL resolution
@@ -390,6 +418,7 @@
   };
 
   log('RTCPeerConnection prototype patched — lossless DC ready');
+  log(`Latency profile: llbuf=${ARMING_TARGET_MS}ms llpreroll=${STARTUP_PREROLL_PACKETS} packet(s)`);
 
   // -------------------------------------------------------------------------
   // Overlay — keyboard-accessible status panel + persistent Disable/Retry buttons.

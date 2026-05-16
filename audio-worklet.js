@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC AudioWorklet Processor v1.0.9
+ * VDO.Ninja Lossless DC AudioWorklet Processor v1.0.10
  *
  * Registered as: 'lossless-audio-processor'
  * Loaded by viewer.js via AudioContext.audioWorklet.addModule()
@@ -8,7 +8,7 @@
  *   main -> worklet: { type: 'frame', samples: Float32Array.buffer, channels: N }
  *   worklet -> main: { type: 'underrun' } | { type: 'arming', armed: bool } | { type: 'buffer' }
  */
-const DEFAULT_ARMING_TARGET_FRAMES = 1440;
+const DEFAULT_ARMING_TARGET_FRAMES = 576;
 const REARM_UNDERRUN_TICKS = 8;
 const BUFFER_STATUS_TICKS = 50;
 

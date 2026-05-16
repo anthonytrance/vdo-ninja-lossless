@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.14';
+  const VERSION     = '1.0.15';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
@@ -85,6 +85,7 @@
              savedVolume: 1.0, gainNode: null,
              lastFrameMs: 0, lastSeq: -1,
              frames: 0, seqDrops: 0, audioUnderruns: 0, concealed: 0,
+             driftSkips: 0, driftRepeats: 0,
              bytes: 0, opusRestored: false, bufferFrames: 0,
              lastGoodFrame: null,
              armed: false, losslessStarted: false, startupQueue: [],
@@ -158,6 +159,12 @@
       }
       if (ev.data.type === 'buffer') {
         peer.bufferFrames = ev.data.filled || 0;
+        _updateOverlay();
+      }
+      if (ev.data.type === 'drift') {
+        peer.driftSkips   = ev.data.skips   || 0;
+        peer.driftRepeats = ev.data.repeats || 0;
+        if (typeof ev.data.filled === 'number') peer.bufferFrames = ev.data.filled;
         _updateOverlay();
       }
     };
@@ -470,7 +477,7 @@
     _overlay.appendChild(_stateNode);
 
     _statsNode = document.createElement('div');
-    _statsNode.textContent = 'Frames: 0  SeqDrops: 0  AudioUnderruns: 0  Conceal: 0  Buffer: 0/0 armed 0ms  ~0 kbps';
+    _statsNode.textContent = 'Frames: 0  SeqDrops: 0  AudioUnderruns: 0  Conceal: 0  Drift: 0/0  Buffer: 0/0 armed 0ms  ~0 kbps';
     _overlay.appendChild(_statsNode);
 
     const btnRow = document.createElement('div');
@@ -516,6 +523,7 @@
     _ensureOverlay();
     if (!_overlay) return;
     let totalFrames = 0, totalSeqDrops = 0, totalAudioUnderruns = 0, totalConcealed = 0;
+    let totalDriftSkips = 0, totalDriftRepeats = 0;
     let totalBytes = 0, armedCount = 0, losslessPeers = 0, minBufferFrames = null;
     for (const [, p] of _peers) {
       if (!p.handshake) continue;
@@ -523,6 +531,8 @@
       totalSeqDrops  += p.seqDrops;
       totalAudioUnderruns += p.audioUnderruns;
       totalConcealed += p.concealed;
+      totalDriftSkips   += p.driftSkips;
+      totalDriftRepeats += p.driftRepeats;
       totalBytes     += p.bytes;
       losslessPeers++;
       if (p.armed) armedCount++;
@@ -534,7 +544,7 @@
 
     if (_stateNode) _stateNode.textContent = stateStr;
     const bufMs = minBufferFrames === null ? 0 : Math.round((minBufferFrames / 48));
-    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  SeqDrops: ${totalSeqDrops}  AudioUnderruns: ${totalAudioUnderruns}  Conceal: ${totalConcealed}  Buffer: ${armedCount}/${losslessPeers} armed ${bufMs}ms  ~${kbps} kbps`;
+    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  SeqDrops: ${totalSeqDrops}  AudioUnderruns: ${totalAudioUnderruns}  Conceal: ${totalConcealed}  Drift: ${totalDriftSkips}/${totalDriftRepeats}  Buffer: ${armedCount}/${losslessPeers} armed ${bufMs}ms  ~${kbps} kbps`;
 
     // Conditional visibility — Disable when lossless is playing, Retry when Opus is.
     if (_disableBtn) {

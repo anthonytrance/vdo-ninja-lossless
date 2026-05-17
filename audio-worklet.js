@@ -1,50 +1,68 @@
 /**
- * VDO.Ninja Lossless DC AudioWorklet Processor v1.0.21
+ * VDO.Ninja Lossless DC AudioWorklet v1.0.21.
  *
- * Registered as: 'lossless-audio-processor'
- * Loaded by viewer.js via AudioContext.audioWorklet.addModule()
+ * GENERATED FILE — do not edit by hand. Regenerate via:
+ *   npm run build:worklet
+ * Sources:
+ *   sidecar/src/playout.js  (canonical playout chain — shared with Node)
+ *   sidecar/browser/audio-worklet.template.js  (AudioWorklet I/O wiring)
  *
- * Protocol:
- *   main -> worklet: { type: 'frame', samples: Float32Array.buffer, channels: N }
- *                    { type: 'setTarget', frames: N }
- *   worklet -> main: { type: 'underrun', filled, needed, target }
- *                    { type: 'arming', armed, filled, ringSize, target }
- *                    { type: 'buffer', filled, ringSize, target }
- *                    { type: 'drift', action, skips, repeats, acc, filled }
+ * The playout chain (arming gate, ring buffer, cosine concealment, drift
+ * servo, re-arm trim, LP filter, cooldown, xfade) is defined in playout.js
+ * so the sidecar receive path can run the exact same chain when it gets
+ * wired up in Pass 6b-B. Browser listeners keep zero runtime dependency on
+ * the sidecar: the chain is inlined here at build time and shipped as one
+ * file via GitHub Pages.
  *
- * v1.0.16 (Step 8, Layer A): single user-controlled target buffer level
- *   (currentTargetFrames). Default 30 ms @ 48 kHz.
- * v1.0.17 (Step 5, Layer B): cosine fade-out/fade-in concealment on
- *   underrun boundaries. CONCEAL_FADE_FRAMES = 32.
- * v1.0.18 (Step 6, Layer C): RemSound-style drift integrator. Per quantum
- *   integrates (filledLp - currentTargetFrames) × dt × 0.005 × gainScale.
- *   When the accumulator crosses ±1 the worklet drops or repeats one
- *   stereo frame over an 8-sample cosine crossfade. The target is
- *   currentTargetFrames from Layer A (v1.0.15's bug: it used the arming
- *   threshold, which is below the natural sawtooth midpoint, so the
- *   integrator never converged). State resets on every (re-)arm.
- * v1.0.19 — ATTEMPTED FIX, REVERTED. Initialising filledLp to target on
- *   re-arm instead of to _filled made the skip rate explode (100/sec) and
- *   drove a feedback loop into more underruns. The slow LP-chase toward
- *   the actual elevated fill kept the integrator firing continuously
- *   during the convergence window instead of one burst at re-arm.
- *   v1.0.18's "front-loaded burst per underrun" turned out to be the
- *   lesser evil; reverting to it as v1.0.20.
- * v1.0.20 (Step 6 — back to v1.0.18 behaviour): filledLp re-initialised
- *   to current _filled on (re-)arm. Post-underrun skip bursts remain as
- *   a known artefact at low target settings; Step 9 (auto-tune) will
- *   resolve them by raising target when underruns happen.
- * v1.0.21 (Step 6 refine): re-arm trims stale queued audio back to the
- *   current target, resumes with a fade-in, and holds/gates the drift
- *   integrator after re-arm so it only sees steady-state clock drift.
+ * Version-by-version playout history (preserved from v1.0.21):
+ *   v1.0.16 (Step 8, Layer A): single user-controlled target buffer level.
+ *   v1.0.17 (Step 5, Layer B): cosine fade-out/fade-in concealment.
+ *   v1.0.18 (Step 6, Layer C): RemSound-style drift integrator.
+ *   v1.0.19 — REVERTED. filledLp = target on re-arm exploded skip rate.
+ *   v1.0.20: filledLp re-initialised to current _filled on (re-)arm.
+ *   v1.0.21: re-arm trims stale queued audio + drift gating after re-arm.
  */
+
+'use strict';
+
+/**
+ * Lossless DC receiver-side playout chain.
+ *
+ * Canonical, source-time-mirrored implementation of the playout state machine
+ * that v1.0.21's AudioWorklet ran inline. Same chain is consumed by:
+ *
+ *   - Browser listener (sidecar/browser/audio-worklet.js, concatenated by
+ *     sidecar/scripts/build-worklet.js). No runtime dependency on this file
+ *     once concatenated — listeners on plain VDO.Ninja never see a sidecar.
+ *   - Node sidecar receive path (wired in a later pass; today this module is
+ *     defined and tested but not yet consumed by sidecar/src/lossless-dc.js).
+ *
+ * Public API:
+ *   new PlayoutChain({ sampleRate, channels, targetFrames, emit, ringSize })
+ *   enqueue(samplesOrArrayBuffer, srcChannels)
+ *   renderQuantum(output /* Float32Array[] per channel *\/, quantum?)
+ *   setTarget(frames)
+ *   getStats() — snapshot of internal counters / drift state
+ *
+ * The owner supplies an `emit(msg)` callback. The chain calls it with the same
+ * messages the worklet used to postMessage:
+ *   { type: 'underrun', filled, needed, target }
+ *   { type: 'arming', armed, filled, ringSize, target }
+ *   { type: 'buffer', filled, ringSize, target }
+ *   { type: 'drift', action, skips, repeats, acc, filled }
+ *   { type: 'rearm-trim', dropped, totalDropped, filled, target }
+ *
+ * Behaviour matches viewer/worklet v1.0.21. See sidecar/browser/audio-worklet.js
+ * header for the version-by-version playout history (Steps 4, 5, 6, 6 refine).
+ */
+
 const DEFAULT_TARGET_FRAMES = 1440;  // 30 ms @ 48 kHz
-const DEFAULT_PACKET_FRAMES = 480;    // 10 ms @ 48 kHz, updated from observed frames.
+const DEFAULT_PACKET_FRAMES = 480;   // 10 ms @ 48 kHz; updated from observed frames.
 const MIN_TARGET_FRAMES = 240;       //  5 ms @ 48 kHz
 const MAX_TARGET_FRAMES = 14400;     // 300 ms @ 48 kHz
 const REARM_UNDERRUN_TICKS = 8;
 const BUFFER_STATUS_TICKS = 50;
-const CONCEAL_FADE_FRAMES = 32;      // ~0.67 ms @ 48 kHz — matches RemSound ConcealFadeFramesShort.
+const CONCEAL_FADE_FRAMES = 32;      // ~0.67 ms @ 48 kHz — RemSound ConcealFadeFramesShort.
 
 // Drift integrator constants (RemSound SessionPlayout.cs, 2026-05-06).
 const DRIFT_GAIN_BASE = 0.005;
@@ -52,29 +70,29 @@ const DRIFT_SMALL_ERROR_FRAMES = 50;
 const DRIFT_MAX_GAIN_SCALE = 20;
 const DRIFT_ACC_CLAMP = 100;
 const DRIFT_XFADE_FRAMES = 8;
-const DRIFT_REARM_HOLD_TICKS = 375;   // ~1 second at 128-frame / 48 kHz quanta.
+const DRIFT_REARM_HOLD_TICKS = 375;   // ~1 s at 128-frame / 48 kHz quanta.
 const DRIFT_MIN_EVENT_TICKS = 32;     // Spread corrections; no skip/repeat bursts.
 // LP-filter alpha for filled, per-quantum. tau ≈ dt / alpha. At alpha=0.0025
 // and dt = 128/48000, tau ≈ 1.07 s — long enough to bury the 10 ms WebRTC
 // burst sawtooth, fast enough to track drift on a few-second timescale.
 const DRIFT_FILL_ALPHA = 0.0025;
 
-function _clampTarget(n) {
+function clampTarget(n) {
   if (!Number.isFinite(n)) return DEFAULT_TARGET_FRAMES;
   return Math.max(MIN_TARGET_FRAMES, Math.min(MAX_TARGET_FRAMES, Math.round(n)));
 }
 
-class LosslessAudioProcessor extends AudioWorkletProcessor {
-  constructor(options) {
-    super();
-    const opts = (options && options.processorOptions) || {};
-    const ch = opts.channels || 2;
-    this._channels = ch;
-    const initialTarget = opts.targetFrames != null ? opts.targetFrames : opts.armingTargetFrames;
-    this.currentTargetFrames = _clampTarget(initialTarget != null ? initialTarget : DEFAULT_TARGET_FRAMES);
+class PlayoutChain {
+  constructor(opts) {
+    const o = opts || {};
+    this.sampleRate = o.sampleRate || 48000;
+    this._channels = o.channels || 2;
+    const initialTarget = o.targetFrames != null ? o.targetFrames : o.armingTargetFrames;
+    this.currentTargetFrames = clampTarget(initialTarget != null ? initialTarget : DEFAULT_TARGET_FRAMES);
+    this._emit = typeof o.emit === 'function' ? o.emit : function () {};
 
-    this._ringSize = 16384;
-    this._ring     = new Array(ch).fill(null).map(() => new Float32Array(this._ringSize));
+    this._ringSize = o.ringSize || 16384;
+    this._ring     = new Array(this._channels).fill(null).map(() => new Float32Array(this._ringSize));
     this._writePos = 0;
     this._readPos  = 0;
     this._filled   = 0;
@@ -82,7 +100,7 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     this._consecutiveUnderruns = 0;
     this._statusTicks = 0;
 
-    this._lastOutSample = new Float32Array(ch);
+    this._lastOutSample = new Float32Array(this._channels);
     this._inConcealment = false;
     this._fadeInOnNextRead = false;
     this._lastPacketFrames = DEFAULT_PACKET_FRAMES;
@@ -100,39 +118,21 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     for (let k = 0; k < DRIFT_XFADE_FRAMES; k++) {
       this._driftXfade[k] = 0.5 * (1 - Math.cos(Math.PI * (k + 1) / DRIFT_XFADE_FRAMES));
     }
-
-    this.port.onmessage = (ev) => {
-      const m = ev.data;
-      if (!m) return;
-      if (m.type === 'frame') {
-        this._enqueue(m.samples, m.channels || ch);
-      } else if (m.type === 'setTarget') {
-        const next = _clampTarget(m.frames);
-        if (next !== this.currentTargetFrames) {
-          this.currentTargetFrames = next;
-          // Runtime target moves belong to the buffer manager / future
-          // auto-tune layer. The drift servo must not turn a target jump
-          // into a skip/repeat burst.
-          this._driftAcc = 0;
-          this._filledLpInit = false;
-          this._driftHoldTicks = DRIFT_REARM_HOLD_TICKS;
-          this._driftEventCooldownTicks = DRIFT_MIN_EVENT_TICKS;
-          this.port.postMessage({ type: 'buffer', filled: this._filled, ringSize: this._ringSize, target: this.currentTargetFrames });
-        }
-      }
-    };
   }
 
-  _enqueue(buffer, srcChannels) {
-    const interleaved = new Float32Array(buffer);
-    const frames = Math.floor(interleaved.length / srcChannels);
+  enqueue(samples, srcChannels) {
+    const interleaved = samples instanceof Float32Array
+      ? samples
+      : new Float32Array(samples);
+    const sc = srcChannels || this._channels;
+    const frames = Math.floor(interleaved.length / sc);
     if (frames > 0) this._lastPacketFrames = frames;
 
     for (let f = 0; f < frames; f++) {
       const wp = (this._writePos + f) % this._ringSize;
       for (let c = 0; c < this._channels; c++) {
-        const sc = c < srcChannels ? c : srcChannels - 1;
-        this._ring[c][wp] = interleaved[f * srcChannels + sc];
+        const sci = c < sc ? c : sc - 1;
+        this._ring[c][wp] = interleaved[f * sc + sci];
       }
     }
     const nextFilled = this._filled + frames;
@@ -146,14 +146,45 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     }
   }
 
+  setTarget(frames) {
+    const next = clampTarget(frames);
+    if (next === this.currentTargetFrames) return;
+    this.currentTargetFrames = next;
+    // Runtime target moves belong to the buffer manager / future auto-tune
+    // layer. The drift servo must not turn a target jump into a skip/repeat
+    // burst.
+    this._driftAcc = 0;
+    this._filledLpInit = false;
+    this._driftHoldTicks = DRIFT_REARM_HOLD_TICKS;
+    this._driftEventCooldownTicks = DRIFT_MIN_EVENT_TICKS;
+    this._emit({ type: 'buffer', filled: this._filled, ringSize: this._ringSize, target: this.currentTargetFrames });
+  }
+
+  getStats() {
+    return {
+      armed: this._armed,
+      filled: this._filled,
+      target: this.currentTargetFrames,
+      ringSize: this._ringSize,
+      driftSkips: this._driftSkips,
+      driftRepeats: this._driftRepeats,
+      driftAcc: this._driftAcc,
+      filledLp: this._filledLp,
+      driftHoldTicks: this._driftHoldTicks,
+      driftEventCooldownTicks: this._driftEventCooldownTicks,
+      rearmTrimFrames: this._rearmTrimFrames,
+      lastPacketFrames: this._lastPacketFrames,
+    };
+  }
+
   _trimStaleFramesForArm() {
-    const keep = _clampTarget(this.currentTargetFrames);
+    const keep = clampTarget(this.currentTargetFrames);
     if (this._filled <= keep) return 0;
     const drop = this._filled - keep;
     this._readPos = (this._writePos - keep + this._ringSize) % this._ringSize;
     this._filled = keep;
     this._rearmTrimFrames += drop;
-    this.port.postMessage({
+    this._emit({
       type: 'rearm-trim',
       dropped: drop,
       totalDropped: this._rearmTrimFrames,
@@ -164,7 +195,7 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
   }
 
   _driftDeadbandFrames(quantum) {
-    // The writer arrives in packet bursts while the worklet drains in render
+    // The writer arrives in packet bursts while the chain drains in render
     // quanta. Treat that normal sawtooth as neutral; drift correction should
     // react to long-term clock slope, not packet phase.
     const halfPacket = Math.max(quantum, Math.round(this._lastPacketFrames / 2));
@@ -186,14 +217,14 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     this._filledLpInit = false;
     this._driftHoldTicks = armed ? DRIFT_REARM_HOLD_TICKS : 0;
     this._driftEventCooldownTicks = armed ? DRIFT_MIN_EVENT_TICKS : 0;
-    this.port.postMessage({ type: 'arming', armed, filled: this._filled, ringSize: this._ringSize, target: this.currentTargetFrames });
+    this._emit({ type: 'arming', armed, filled: this._filled, ringSize: this._ringSize, target: this.currentTargetFrames });
   }
 
   _postBufferStatus() {
     this._statusTicks++;
     if (this._statusTicks < BUFFER_STATUS_TICKS) return;
     this._statusTicks = 0;
-    this.port.postMessage({ type: 'buffer', filled: this._filled, ringSize: this._ringSize, target: this.currentTargetFrames });
+    this._emit({ type: 'buffer', filled: this._filled, ringSize: this._ringSize, target: this.currentTargetFrames });
   }
 
   _writeConcealmentFadeOut(output, quantum) {
@@ -211,15 +242,14 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     }
   }
 
-  process(_inputs, outputs) {
-    const output = outputs[0];
-    const quantum = output[0] ? output[0].length : 128;
+  renderQuantum(output, quantum) {
+    quantum = quantum != null ? quantum : (output[0] ? output[0].length : 128);
 
     if (!this._armed) {
       if (this._filled < this.currentTargetFrames) {
         for (const ch of output) ch.fill(0);
         this._postBufferStatus();
-        return true;
+        return;
       }
       this._setArmed(true);
     }
@@ -231,10 +261,10 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
       } else {
         for (const ch of output) ch.fill(0);
       }
-      this.port.postMessage({ type: 'underrun', filled: this._filled, needed: quantum, target: this.currentTargetFrames });
+      this._emit({ type: 'underrun', filled: this._filled, needed: quantum, target: this.currentTargetFrames });
       this._consecutiveUnderruns++;
       if (this._consecutiveUnderruns >= REARM_UNDERRUN_TICKS) this._setArmed(false);
-      return true;
+      return;
     }
 
     // extra: +1 = skip one source frame this quantum (drain by one),
@@ -271,7 +301,7 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
         const gainScale = controlledAbs <= DRIFT_SMALL_ERROR_FRAMES
           ? 1
           : Math.min(controlledAbs / DRIFT_SMALL_ERROR_FRAMES, DRIFT_MAX_GAIN_SCALE);
-        this._driftAcc += controlledError * (quantum / sampleRate) * DRIFT_GAIN_BASE * gainScale;
+        this._driftAcc += controlledError * (quantum / this.sampleRate) * DRIFT_GAIN_BASE * gainScale;
         if (this._driftAcc > DRIFT_ACC_CLAMP) this._driftAcc = DRIFT_ACC_CLAMP;
         else if (this._driftAcc < -DRIFT_ACC_CLAMP) this._driftAcc = -DRIFT_ACC_CLAMP;
       }
@@ -282,7 +312,7 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
         this._driftSkips++;
         this._driftEventCooldownTicks = DRIFT_MIN_EVENT_TICKS;
         extra = 1;
-        this.port.postMessage({
+        this._emit({
           type: 'drift', action: 'skip',
           skips: this._driftSkips, repeats: this._driftRepeats,
           acc: this._driftAcc, filled: this._filled,
@@ -292,7 +322,7 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
         this._driftRepeats++;
         this._driftEventCooldownTicks = DRIFT_MIN_EVENT_TICKS;
         extra = -1;
-        this.port.postMessage({
+        this._emit({
           type: 'drift', action: 'repeat',
           skips: this._driftSkips, repeats: this._driftRepeats,
           acc: this._driftAcc, filled: this._filled,
@@ -344,6 +374,72 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
 
     this._consecutiveUnderruns = 0;
     this._postBufferStatus();
+  }
+}
+
+// Dual-context export. In Node this populates module.exports; in the
+// AudioWorklet global scope (where `module` is undefined), `typeof module`
+// returns 'undefined' under strict mode and the block is skipped without
+// throwing — so this same source file is safe to concatenate into the worklet.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    PlayoutChain,
+    clampTarget,
+    DEFAULT_TARGET_FRAMES,
+    DEFAULT_PACKET_FRAMES,
+    MIN_TARGET_FRAMES,
+    MAX_TARGET_FRAMES,
+    REARM_UNDERRUN_TICKS,
+    BUFFER_STATUS_TICKS,
+    CONCEAL_FADE_FRAMES,
+    DRIFT_GAIN_BASE,
+    DRIFT_SMALL_ERROR_FRAMES,
+    DRIFT_MAX_GAIN_SCALE,
+    DRIFT_ACC_CLAMP,
+    DRIFT_XFADE_FRAMES,
+    DRIFT_REARM_HOLD_TICKS,
+    DRIFT_MIN_EVENT_TICKS,
+    DRIFT_FILL_ALPHA,
+  };
+}
+
+// AudioWorklet shell for the lossless DC receiver. The playout chain itself
+// lives in sidecar/src/playout.js and is concatenated above this template by
+// sidecar/scripts/build-worklet.js. Edit playout.js for chain logic; edit this
+// template only for AudioWorklet I/O wiring.
+
+class LosslessAudioProcessor extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    const opts = (options && options.processorOptions) || {};
+    this._playout = new PlayoutChain({
+      sampleRate,
+      channels: opts.channels || 2,
+      targetFrames: opts.targetFrames != null ? opts.targetFrames : opts.armingTargetFrames,
+      emit: (msg) => this.port.postMessage(msg),
+    });
+
+    this.port.onmessage = (ev) => {
+      const m = ev.data;
+      if (!m) return;
+      if (m.type === 'frame') {
+        this._playout.enqueue(m.samples, m.channels);
+      } else if (m.type === 'setTarget') {
+        this._playout.setTarget(m.frames);
+      }
+    };
+  }
+
+  // Expose internals the rearm test pokes at. Keep this tiny — anything
+  // beyond test surface belongs as a real method on PlayoutChain.
+  get _filled() { return this._playout._filled; }
+  get _driftHoldTicks() { return this._playout._driftHoldTicks; }
+  get _driftAcc() { return this._playout._driftAcc; }
+
+  process(_inputs, outputs) {
+    const output = outputs[0];
+    if (!output) return true;
+    this._playout.renderQuantum(output);
     return true;
   }
 }

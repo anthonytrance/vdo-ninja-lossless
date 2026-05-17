@@ -13,10 +13,10 @@ https://vdo.ninja/?room=YOURROOM&js=https://anthonytrance.github.io/vdo-ninja-lo
 Optional low-latency tuning parameters are normal top-level VDO.Ninja URL parameters:
 
 ```text
-&losslessBufferMs=8&losslessPreroll=1
+&dcBuffer=30&losslessPreroll=2
 ```
 
-Defaults: `losslessBufferMs=12`, `losslessPreroll=2`.
+Defaults: `dcBuffer=30`, `losslessPreroll=2`. `losslessBufferMs` is still accepted as a backwards-compatible alias for `dcBuffer`.
 
 ## Files
 
@@ -30,7 +30,7 @@ A small testing panel shows:
 - `LOSSLESS ACTIVE` / `OPUS FALLBACK` / `LOSSLESS DISABLED` / `IDLE`
 - Disable lossless and Retry lossless buttons
 - Viewer/worklet/protocol version
-- Frames, sequence drops, AudioWorklet underruns, concealed frames, buffer depth, approximate kbps
+- Frames, sequence drops, AudioWorklet underruns, concealed frames, drift corrections, re-arm trim, buffer depth, approximate kbps
 
 Screen readers receive state-change announcements only; stats are visual/testing-only and are not spammed through `aria-live`.
 

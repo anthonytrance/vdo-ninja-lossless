@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC AudioWorklet Processor v1.0.20
+ * VDO.Ninja Lossless DC AudioWorklet Processor v1.0.21
  *
  * Registered as: 'lossless-audio-processor'
  * Loaded by viewer.js via AudioContext.audioWorklet.addModule()
@@ -34,8 +34,12 @@
  *   to current _filled on (re-)arm. Post-underrun skip bursts remain as
  *   a known artefact at low target settings; Step 9 (auto-tune) will
  *   resolve them by raising target when underruns happen.
+ * v1.0.21 (Step 6 refine): re-arm trims stale queued audio back to the
+ *   current target, resumes with a fade-in, and holds/gates the drift
+ *   integrator after re-arm so it only sees steady-state clock drift.
  */
 const DEFAULT_TARGET_FRAMES = 1440;  // 30 ms @ 48 kHz
+const DEFAULT_PACKET_FRAMES = 480;    // 10 ms @ 48 kHz, updated from observed frames.
 const MIN_TARGET_FRAMES = 240;       //  5 ms @ 48 kHz
 const MAX_TARGET_FRAMES = 14400;     // 300 ms @ 48 kHz
 const REARM_UNDERRUN_TICKS = 8;
@@ -48,6 +52,8 @@ const DRIFT_SMALL_ERROR_FRAMES = 50;
 const DRIFT_MAX_GAIN_SCALE = 20;
 const DRIFT_ACC_CLAMP = 100;
 const DRIFT_XFADE_FRAMES = 8;
+const DRIFT_REARM_HOLD_TICKS = 375;   // ~1 second at 128-frame / 48 kHz quanta.
+const DRIFT_MIN_EVENT_TICKS = 32;     // Spread corrections; no skip/repeat bursts.
 // LP-filter alpha for filled, per-quantum. tau ≈ dt / alpha. At alpha=0.0025
 // and dt = 128/48000, tau ≈ 1.07 s — long enough to bury the 10 ms WebRTC
 // burst sawtooth, fast enough to track drift on a few-second timescale.
@@ -78,6 +84,9 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
 
     this._lastOutSample = new Float32Array(ch);
     this._inConcealment = false;
+    this._fadeInOnNextRead = false;
+    this._lastPacketFrames = DEFAULT_PACKET_FRAMES;
+    this._rearmTrimFrames = 0;
 
     // Drift integrator state. Resets on every (re-)arm.
     this._driftAcc = 0;
@@ -85,6 +94,8 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     this._filledLpInit = false;
     this._driftSkips = 0;
     this._driftRepeats = 0;
+    this._driftHoldTicks = 0;
+    this._driftEventCooldownTicks = 0;
     this._driftXfade = new Float32Array(DRIFT_XFADE_FRAMES);
     for (let k = 0; k < DRIFT_XFADE_FRAMES; k++) {
       this._driftXfade[k] = 0.5 * (1 - Math.cos(Math.PI * (k + 1) / DRIFT_XFADE_FRAMES));
@@ -99,6 +110,13 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
         const next = _clampTarget(m.frames);
         if (next !== this.currentTargetFrames) {
           this.currentTargetFrames = next;
+          // Runtime target moves belong to the buffer manager / future
+          // auto-tune layer. The drift servo must not turn a target jump
+          // into a skip/repeat burst.
+          this._driftAcc = 0;
+          this._filledLpInit = false;
+          this._driftHoldTicks = DRIFT_REARM_HOLD_TICKS;
+          this._driftEventCooldownTicks = DRIFT_MIN_EVENT_TICKS;
           this.port.postMessage({ type: 'buffer', filled: this._filled, ringSize: this._ringSize, target: this.currentTargetFrames });
         }
       }
@@ -108,6 +126,7 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
   _enqueue(buffer, srcChannels) {
     const interleaved = new Float32Array(buffer);
     const frames = Math.floor(interleaved.length / srcChannels);
+    if (frames > 0) this._lastPacketFrames = frames;
 
     for (let f = 0; f < frames; f++) {
       const wp = (this._writePos + f) % this._ringSize;
@@ -116,20 +135,57 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
         this._ring[c][wp] = interleaved[f * srcChannels + sc];
       }
     }
+    const nextFilled = this._filled + frames;
     this._writePos = (this._writePos + frames) % this._ringSize;
-    this._filled   = Math.min(this._filled + frames, this._ringSize);
+    if (nextFilled > this._ringSize) {
+      const overflow = nextFilled - this._ringSize;
+      this._readPos = (this._readPos + overflow) % this._ringSize;
+      this._filled = this._ringSize;
+    } else {
+      this._filled = nextFilled;
+    }
+  }
+
+  _trimStaleFramesForArm() {
+    const keep = _clampTarget(this.currentTargetFrames);
+    if (this._filled <= keep) return 0;
+    const drop = this._filled - keep;
+    this._readPos = (this._writePos - keep + this._ringSize) % this._ringSize;
+    this._filled = keep;
+    this._rearmTrimFrames += drop;
+    this.port.postMessage({
+      type: 'rearm-trim',
+      dropped: drop,
+      totalDropped: this._rearmTrimFrames,
+      filled: this._filled,
+      target: this.currentTargetFrames,
+    });
+    return drop;
+  }
+
+  _driftDeadbandFrames(quantum) {
+    // The writer arrives in packet bursts while the worklet drains in render
+    // quanta. Treat that normal sawtooth as neutral; drift correction should
+    // react to long-term clock slope, not packet phase.
+    const halfPacket = Math.max(quantum, Math.round(this._lastPacketFrames / 2));
+    const halfTarget = Math.max(quantum, Math.round(this.currentTargetFrames / 2));
+    return Math.min(halfPacket, halfTarget);
   }
 
   _setArmed(armed) {
     if (this._armed === armed) return;
+    if (armed) this._trimStaleFramesForArm();
     this._armed = armed;
     this._consecutiveUnderruns = 0;
     this._inConcealment = false;
+    this._fadeInOnNextRead = !!armed;
     for (let c = 0; c < this._channels; c++) this._lastOutSample[c] = 0;
     // Drift state: reset accumulator and the LP filter so a fresh session
     // doesn't carry forward stale drift accounting from before the silence.
     this._driftAcc = 0;
     this._filledLpInit = false;
+    this._driftHoldTicks = armed ? DRIFT_REARM_HOLD_TICKS : 0;
+    this._driftEventCooldownTicks = armed ? DRIFT_MIN_EVENT_TICKS : 0;
     this.port.postMessage({ type: 'arming', armed, filled: this._filled, ringSize: this._ringSize, target: this.currentTargetFrames });
   }
 
@@ -181,54 +237,76 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
       return true;
     }
 
-    // Drift integrator (Layer C). Runs every armed, data-bearing quantum.
-    // LP-filter the observed fill so the WebRTC burst sawtooth doesn't
-    // masquerade as drift. Initialise the LP to the current fill on first
-    // tick (and after every re-arm) to skip the long startup transient.
-    if (!this._filledLpInit) {
-      this._filledLp = this._filled;
-      this._filledLpInit = true;
-    } else {
-      this._filledLp += DRIFT_FILL_ALPHA * (this._filled - this._filledLp);
-    }
-    const error = this._filledLp - this.currentTargetFrames;
-    const absErr = error >= 0 ? error : -error;
-    const gainScale = absErr <= DRIFT_SMALL_ERROR_FRAMES
-      ? 1
-      : Math.min(absErr / DRIFT_SMALL_ERROR_FRAMES, DRIFT_MAX_GAIN_SCALE);
-    this._driftAcc += error * (quantum / sampleRate) * DRIFT_GAIN_BASE * gainScale;
-    if (this._driftAcc > DRIFT_ACC_CLAMP) this._driftAcc = DRIFT_ACC_CLAMP;
-    else if (this._driftAcc < -DRIFT_ACC_CLAMP) this._driftAcc = -DRIFT_ACC_CLAMP;
-
     // extra: +1 = skip one source frame this quantum (drain by one),
     //        -1 = repeat one frame (grow by one).
     let extra = 0;
-    if (this._driftAcc >= 1 && this._filled >= quantum + 1) {
-      this._driftAcc -= 1;
-      this._driftSkips++;
-      extra = 1;
-      this.port.postMessage({
-        type: 'drift', action: 'skip',
-        skips: this._driftSkips, repeats: this._driftRepeats,
-        acc: this._driftAcc, filled: this._filled,
-      });
-    } else if (this._driftAcc <= -1) {
-      this._driftAcc += 1;
-      this._driftRepeats++;
-      extra = -1;
-      this.port.postMessage({
-        type: 'drift', action: 'repeat',
-        skips: this._driftSkips, repeats: this._driftRepeats,
-        acc: this._driftAcc, filled: this._filled,
-      });
+    if (this._driftHoldTicks > 0) {
+      this._driftHoldTicks--;
+      this._driftAcc = 0;
+      this._filledLp = this._filled;
+      this._filledLpInit = true;
+    } else {
+      // Drift integrator (Layer C). Runs every armed, data-bearing quantum.
+      // LP-filter the observed fill so the WebRTC burst sawtooth doesn't
+      // masquerade as drift. Initialise the LP to the current fill on first
+      // tick (and after every re-arm) to skip the long startup transient.
+      if (!this._filledLpInit) {
+        this._filledLp = this._filled;
+        this._filledLpInit = true;
+      } else {
+        this._filledLp += DRIFT_FILL_ALPHA * (this._filled - this._filledLp);
+      }
+
+      const error = this._filledLp - this.currentTargetFrames;
+      const absErr = error >= 0 ? error : -error;
+      const deadband = this._driftDeadbandFrames(quantum);
+      if (absErr <= deadband) {
+        // Decay stale accumulator so a brief packet-phase excursion does not
+        // fire later after conditions have returned to normal.
+        this._driftAcc *= 0.98;
+        if (this._driftAcc > -0.001 && this._driftAcc < 0.001) this._driftAcc = 0;
+      } else {
+        const controlledError = error > 0 ? error - deadband : error + deadband;
+        const controlledAbs = controlledError >= 0 ? controlledError : -controlledError;
+        const gainScale = controlledAbs <= DRIFT_SMALL_ERROR_FRAMES
+          ? 1
+          : Math.min(controlledAbs / DRIFT_SMALL_ERROR_FRAMES, DRIFT_MAX_GAIN_SCALE);
+        this._driftAcc += controlledError * (quantum / sampleRate) * DRIFT_GAIN_BASE * gainScale;
+        if (this._driftAcc > DRIFT_ACC_CLAMP) this._driftAcc = DRIFT_ACC_CLAMP;
+        else if (this._driftAcc < -DRIFT_ACC_CLAMP) this._driftAcc = -DRIFT_ACC_CLAMP;
+      }
+
+      if (this._driftEventCooldownTicks > 0) this._driftEventCooldownTicks--;
+      if (this._driftEventCooldownTicks <= 0 && this._driftAcc >= 1 && this._filled >= quantum + 1) {
+        this._driftAcc -= 1;
+        this._driftSkips++;
+        this._driftEventCooldownTicks = DRIFT_MIN_EVENT_TICKS;
+        extra = 1;
+        this.port.postMessage({
+          type: 'drift', action: 'skip',
+          skips: this._driftSkips, repeats: this._driftRepeats,
+          acc: this._driftAcc, filled: this._filled,
+        });
+      } else if (this._driftEventCooldownTicks <= 0 && this._driftAcc <= -1) {
+        this._driftAcc += 1;
+        this._driftRepeats++;
+        this._driftEventCooldownTicks = DRIFT_MIN_EVENT_TICKS;
+        extra = -1;
+        this.port.postMessage({
+          type: 'drift', action: 'repeat',
+          skips: this._driftSkips, repeats: this._driftRepeats,
+          acc: this._driftAcc, filled: this._filled,
+        });
+      }
     }
 
     // First quantum back after concealment: cosine fade-in on the first
     // CONCEAL_FADE_FRAMES samples. Drift skip/repeat still applies to the
     // last DRIFT_XFADE_FRAMES samples; the two windows don't overlap at
     // standard quanta (128) since 32 + 8 < 128.
-    const inFadeIn = this._inConcealment;
+    const inFadeIn = this._inConcealment || this._fadeInOnNextRead;
     this._inConcealment = false;
+    this._fadeInOnNextRead = false;
     const xfadeStart = quantum - DRIFT_XFADE_FRAMES;
     for (let f = 0; f < quantum; f++) {
       const rp = (this._readPos + f) % this._ringSize;

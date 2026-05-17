@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC AudioWorklet Processor v1.0.17
+ * VDO.Ninja Lossless DC AudioWorklet Processor v1.0.18
  *
  * Registered as: 'lossless-audio-processor'
  * Loaded by viewer.js via AudioContext.audioWorklet.addModule()
@@ -10,17 +10,19 @@
  *   worklet -> main: { type: 'underrun', filled, needed, target }
  *                    { type: 'arming', armed, filled, ringSize, target }
  *                    { type: 'buffer', filled, ringSize, target }
+ *                    { type: 'drift', action, skips, repeats, acc, filled }
  *
  * v1.0.16 (Step 8, Layer A): single user-controlled target buffer level
- *   (currentTargetFrames). Doubles as arming threshold AND (Step 6) drift
- *   target. Default 30 ms @ 48 kHz = 1440 frames.
- *
- * v1.0.17 (Step 5, Layer B): cosine fade-out on first underrun, cosine
- *   fade-in on first refill. CONCEAL_FADE_FRAMES = 32. After
- *   REARM_UNDERRUN_TICKS consecutive empty quanta the worklet re-arms
- *   (existing behavior); the fade-out + hard silence keeps the audible
- *   signature of a brief underrun to "dipped briefly" instead of
- *   "click-silence-click."
+ *   (currentTargetFrames). Default 30 ms @ 48 kHz.
+ * v1.0.17 (Step 5, Layer B): cosine fade-out/fade-in concealment on
+ *   underrun boundaries. CONCEAL_FADE_FRAMES = 32.
+ * v1.0.18 (Step 6, Layer C): RemSound-style drift integrator. Per quantum
+ *   integrates (filledLp - currentTargetFrames) × dt × 0.005 × gainScale.
+ *   When the accumulator crosses ±1 the worklet drops or repeats one
+ *   stereo frame over an 8-sample cosine crossfade. The target is
+ *   currentTargetFrames from Layer A (v1.0.15's bug: it used the arming
+ *   threshold, which is below the natural sawtooth midpoint, so the
+ *   integrator never converged). State resets on every (re-)arm.
  */
 const DEFAULT_TARGET_FRAMES = 1440;  // 30 ms @ 48 kHz
 const MIN_TARGET_FRAMES = 240;       //  5 ms @ 48 kHz
@@ -28,6 +30,17 @@ const MAX_TARGET_FRAMES = 14400;     // 300 ms @ 48 kHz
 const REARM_UNDERRUN_TICKS = 8;
 const BUFFER_STATUS_TICKS = 50;
 const CONCEAL_FADE_FRAMES = 32;      // ~0.67 ms @ 48 kHz — matches RemSound ConcealFadeFramesShort.
+
+// Drift integrator constants (RemSound SessionPlayout.cs, 2026-05-06).
+const DRIFT_GAIN_BASE = 0.005;
+const DRIFT_SMALL_ERROR_FRAMES = 50;
+const DRIFT_MAX_GAIN_SCALE = 20;
+const DRIFT_ACC_CLAMP = 100;
+const DRIFT_XFADE_FRAMES = 8;
+// LP-filter alpha for filled, per-quantum. tau ≈ dt / alpha. At alpha=0.0025
+// and dt = 128/48000, tau ≈ 1.07 s — long enough to bury the 10 ms WebRTC
+// burst sawtooth, fast enough to track drift on a few-second timescale.
+const DRIFT_FILL_ALPHA = 0.0025;
 
 function _clampTarget(n) {
   if (!Number.isFinite(n)) return DEFAULT_TARGET_FRAMES;
@@ -52,13 +65,19 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     this._consecutiveUnderruns = 0;
     this._statusTicks = 0;
 
-    // Concealment state (Layer B). _lastOutSample tracks the trailing sample
-    // per channel after every successful read so a fade-OUT on the next
-    // underrun starts from continuous audio rather than zero. _inConcealment
-    // latches between the underrun that triggered the fade-out and the next
-    // non-empty quantum that needs a fade-IN.
     this._lastOutSample = new Float32Array(ch);
     this._inConcealment = false;
+
+    // Drift integrator state. Resets on every (re-)arm.
+    this._driftAcc = 0;
+    this._filledLp = 0;
+    this._filledLpInit = false;
+    this._driftSkips = 0;
+    this._driftRepeats = 0;
+    this._driftXfade = new Float32Array(DRIFT_XFADE_FRAMES);
+    for (let k = 0; k < DRIFT_XFADE_FRAMES; k++) {
+      this._driftXfade[k] = 0.5 * (1 - Math.cos(Math.PI * (k + 1) / DRIFT_XFADE_FRAMES));
+    }
 
     this.port.onmessage = (ev) => {
       const m = ev.data;
@@ -94,10 +113,12 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     if (this._armed === armed) return;
     this._armed = armed;
     this._consecutiveUnderruns = 0;
-    // Reset concealment state on every arm transition so a fresh
-    // session doesn't carry stale fade-out residue from a previous gap.
     this._inConcealment = false;
     for (let c = 0; c < this._channels; c++) this._lastOutSample[c] = 0;
+    // Drift state: reset accumulator and the LP filter so a fresh session
+    // doesn't carry forward stale drift accounting from before the silence.
+    this._driftAcc = 0;
+    this._filledLpInit = false;
     this.port.postMessage({ type: 'arming', armed, filled: this._filled, ringSize: this._ringSize, target: this.currentTargetFrames });
   }
 
@@ -108,15 +129,9 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     this.port.postMessage({ type: 'buffer', filled: this._filled, ringSize: this._ringSize, target: this.currentTargetFrames });
   }
 
-  // Writes a cosine fade-out of CONCEAL_FADE_FRAMES samples from _lastOutSample
-  // toward zero into the first 32 samples of `output`, then hard-silences the
-  // rest of the quantum. Called when an underrun is detected and concealment
-  // wasn't already active.
   _writeConcealmentFadeOut(output, quantum) {
     const fadeFrames = Math.min(CONCEAL_FADE_FRAMES, quantum);
     for (let f = 0; f < fadeFrames; f++) {
-      // gain = (cos(π × t) + 1) / 2, t = (f+1)/fadeFrames
-      // f=0 → t≈1/32, gain≈0.9976; f=fadeFrames-1 → t=1, gain=0.
       const t = (f + 1) / fadeFrames;
       const gain = (Math.cos(Math.PI * t) + 1) * 0.5;
       for (let c = 0; c < output.length; c++) {
@@ -126,30 +141,6 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     }
     for (let c = 0; c < output.length; c++) {
       for (let f = fadeFrames; f < quantum; f++) output[c][f] = 0;
-    }
-  }
-
-  // Writes a cosine fade-in over the first 32 samples of the quantum, scaling
-  // the actual ring samples from 0 → 1, then copies the remainder verbatim.
-  // Advances readPos / filled / _lastOutSample as a normal read would.
-  _readWithFadeIn(output, quantum) {
-    const fadeFrames = Math.min(CONCEAL_FADE_FRAMES, quantum);
-    for (let f = 0; f < quantum; f++) {
-      const rp = (this._readPos + f) % this._ringSize;
-      const t = (f + 1) / fadeFrames;
-      const gain = f < fadeFrames ? (1 - Math.cos(Math.PI * t)) * 0.5 : 1;
-      for (let c = 0; c < output.length; c++) {
-        const rc = c < this._channels ? c : this._channels - 1;
-        output[c][f] = this._ring[rc][rp] * gain;
-      }
-    }
-    this._readPos = (this._readPos + quantum) % this._ringSize;
-    this._filled -= quantum;
-    // _lastOutSample is the trailing sample (post-fade, so full-gain).
-    for (let c = 0; c < output.length; c++) {
-      const rc = c < this._channels ? c : this._channels - 1;
-      const rp = (this._readPos - 1 + this._ringSize) % this._ringSize;
-      this._lastOutSample[rc] = this._ring[rc][rp];
     }
   }
 
@@ -168,13 +159,9 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
 
     if (this._filled < quantum) {
       if (!this._inConcealment) {
-        // First empty quantum of this underrun: cosine fade-out from last
-        // good sample toward zero, hard silence for the remainder.
         this._writeConcealmentFadeOut(output, quantum);
         this._inConcealment = true;
       } else {
-        // Already concealed: stay silent until either we get data back
-        // (fade-in path below) or we hit the re-arm threshold.
         for (const ch of output) ch.fill(0);
       }
       this.port.postMessage({ type: 'underrun', filled: this._filled, needed: quantum, target: this.currentTargetFrames });
@@ -183,27 +170,89 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
       return true;
     }
 
-    if (this._inConcealment) {
-      // First quantum back with data after an underrun: fade in.
-      this._readWithFadeIn(output, quantum);
-      this._inConcealment = false;
+    // Drift integrator (Layer C). Runs every armed, data-bearing quantum.
+    // LP-filter the observed fill so the WebRTC burst sawtooth doesn't
+    // masquerade as drift. Initialise the LP to the current fill on first
+    // tick (and after every re-arm) to skip the long startup transient.
+    if (!this._filledLpInit) {
+      this._filledLp = this._filled;
+      this._filledLpInit = true;
     } else {
-      for (let f = 0; f < quantum; f++) {
-        const rp = (this._readPos + f) % this._ringSize;
-        for (let c = 0; c < output.length; c++) {
-          const rc = c < this._channels ? c : this._channels - 1;
-          output[c][f] = this._ring[rc][rp];
-        }
+      this._filledLp += DRIFT_FILL_ALPHA * (this._filled - this._filledLp);
+    }
+    const error = this._filledLp - this.currentTargetFrames;
+    const absErr = error >= 0 ? error : -error;
+    const gainScale = absErr <= DRIFT_SMALL_ERROR_FRAMES
+      ? 1
+      : Math.min(absErr / DRIFT_SMALL_ERROR_FRAMES, DRIFT_MAX_GAIN_SCALE);
+    this._driftAcc += error * (quantum / sampleRate) * DRIFT_GAIN_BASE * gainScale;
+    if (this._driftAcc > DRIFT_ACC_CLAMP) this._driftAcc = DRIFT_ACC_CLAMP;
+    else if (this._driftAcc < -DRIFT_ACC_CLAMP) this._driftAcc = -DRIFT_ACC_CLAMP;
+
+    // extra: +1 = skip one source frame this quantum (drain by one),
+    //        -1 = repeat one frame (grow by one).
+    let extra = 0;
+    if (this._driftAcc >= 1 && this._filled >= quantum + 1) {
+      this._driftAcc -= 1;
+      this._driftSkips++;
+      extra = 1;
+      this.port.postMessage({
+        type: 'drift', action: 'skip',
+        skips: this._driftSkips, repeats: this._driftRepeats,
+        acc: this._driftAcc, filled: this._filled,
+      });
+    } else if (this._driftAcc <= -1) {
+      this._driftAcc += 1;
+      this._driftRepeats++;
+      extra = -1;
+      this.port.postMessage({
+        type: 'drift', action: 'repeat',
+        skips: this._driftSkips, repeats: this._driftRepeats,
+        acc: this._driftAcc, filled: this._filled,
+      });
+    }
+
+    // First quantum back after concealment: cosine fade-in on the first
+    // CONCEAL_FADE_FRAMES samples. Drift skip/repeat still applies to the
+    // last DRIFT_XFADE_FRAMES samples; the two windows don't overlap at
+    // standard quanta (128) since 32 + 8 < 128.
+    const inFadeIn = this._inConcealment;
+    this._inConcealment = false;
+    const xfadeStart = quantum - DRIFT_XFADE_FRAMES;
+    for (let f = 0; f < quantum; f++) {
+      const rp = (this._readPos + f) % this._ringSize;
+      let neighbourIdx = rp;
+      let w = 0;
+      if (extra !== 0 && f >= xfadeStart) {
+        w = this._driftXfade[f - xfadeStart];
+        neighbourIdx = extra === 1
+          ? (rp + 1) % this._ringSize
+          : (rp - 1 + this._ringSize) % this._ringSize;
       }
-      this._readPos = (this._readPos + quantum) % this._ringSize;
-      this._filled -= quantum;
-      // Stash the trailing sample for the next potential fade-out.
+      let preFadeGain = 1;
+      if (inFadeIn && f < CONCEAL_FADE_FRAMES) {
+        const t = (f + 1) / CONCEAL_FADE_FRAMES;
+        preFadeGain = (1 - Math.cos(Math.PI * t)) * 0.5;
+      }
       for (let c = 0; c < output.length; c++) {
         const rc = c < this._channels ? c : this._channels - 1;
-        const rp = (this._readPos - 1 + this._ringSize) % this._ringSize;
-        this._lastOutSample[rc] = this._ring[rc][rp];
+        const v = this._ring[rc][rp];
+        const blended = w === 0 ? v : ((1 - w) * v + w * this._ring[rc][neighbourIdx]);
+        output[c][f] = blended * preFadeGain;
       }
     }
+    const consumed = quantum + extra;
+    this._readPos = (this._readPos + consumed) % this._ringSize;
+    this._filled -= consumed;
+
+    // Stash trailing sample for the next potential fade-out. After a drift
+    // skip the trailing sample is the post-blend output we wrote, which is
+    // already in output[c][quantum-1].
+    for (let c = 0; c < output.length; c++) {
+      const rc = c < this._channels ? c : this._channels - 1;
+      this._lastOutSample[rc] = output[c][quantum - 1];
+    }
+
     this._consecutiveUnderruns = 0;
     this._postBufferStatus();
     return true;

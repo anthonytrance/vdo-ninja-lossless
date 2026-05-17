@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC AudioWorklet Processor v1.0.19
+ * VDO.Ninja Lossless DC AudioWorklet Processor v1.0.20
  *
  * Registered as: 'lossless-audio-processor'
  * Loaded by viewer.js via AudioContext.audioWorklet.addModule()
@@ -23,16 +23,17 @@
  *   currentTargetFrames from Layer A (v1.0.15's bug: it used the arming
  *   threshold, which is below the natural sawtooth midpoint, so the
  *   integrator never converged). State resets on every (re-)arm.
- * v1.0.19 (Step 6 refinement): on (re-)arm, initialise filledLp to
- *   currentTargetFrames instead of current _filled. After an underrun,
- *   queued packets pile up and re-arming sees _filled well above target;
- *   the prior init-at-fill caused the integrator to interpret that
- *   one-shot overshoot as drift and fire a recovery burst of skips per
- *   underrun. Initialising at target keeps error=0 at re-arm so the
- *   integrator only fires for sustained drift, not transient overshoot.
- *   Post-underrun extra fill is left to drain naturally via real clock
- *   drift; the residual elevated buffer is a feature (more headroom,
- *   fewer next underruns).
+ * v1.0.19 — ATTEMPTED FIX, REVERTED. Initialising filledLp to target on
+ *   re-arm instead of to _filled made the skip rate explode (100/sec) and
+ *   drove a feedback loop into more underruns. The slow LP-chase toward
+ *   the actual elevated fill kept the integrator firing continuously
+ *   during the convergence window instead of one burst at re-arm.
+ *   v1.0.18's "front-loaded burst per underrun" turned out to be the
+ *   lesser evil; reverting to it as v1.0.20.
+ * v1.0.20 (Step 6 — back to v1.0.18 behaviour): filledLp re-initialised
+ *   to current _filled on (re-)arm. Post-underrun skip bursts remain as
+ *   a known artefact at low target settings; Step 9 (auto-tune) will
+ *   resolve them by raising target when underruns happen.
  */
 const DEFAULT_TARGET_FRAMES = 1440;  // 30 ms @ 48 kHz
 const MIN_TARGET_FRAMES = 240;       //  5 ms @ 48 kHz
@@ -185,12 +186,7 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     // masquerade as drift. Initialise the LP to the current fill on first
     // tick (and after every re-arm) to skip the long startup transient.
     if (!this._filledLpInit) {
-      // v1.0.19: init at target, not _filled. After an underrun, _filled
-      // at re-arm includes the queued-burst overshoot; treating that
-      // overshoot as the LP starting point made the integrator dump skips
-      // to "fix" it. With LP=target at re-arm, the integrator stays quiet
-      // until real drift accumulates.
-      this._filledLp = this.currentTargetFrames;
+      this._filledLp = this._filled;
       this._filledLpInit = true;
     } else {
       this._filledLp += DRIFT_FILL_ALPHA * (this._filled - this._filledLp);

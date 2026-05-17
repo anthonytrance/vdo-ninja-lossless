@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC AudioWorklet Processor v1.0.18
+ * VDO.Ninja Lossless DC AudioWorklet Processor v1.0.19
  *
  * Registered as: 'lossless-audio-processor'
  * Loaded by viewer.js via AudioContext.audioWorklet.addModule()
@@ -23,6 +23,16 @@
  *   currentTargetFrames from Layer A (v1.0.15's bug: it used the arming
  *   threshold, which is below the natural sawtooth midpoint, so the
  *   integrator never converged). State resets on every (re-)arm.
+ * v1.0.19 (Step 6 refinement): on (re-)arm, initialise filledLp to
+ *   currentTargetFrames instead of current _filled. After an underrun,
+ *   queued packets pile up and re-arming sees _filled well above target;
+ *   the prior init-at-fill caused the integrator to interpret that
+ *   one-shot overshoot as drift and fire a recovery burst of skips per
+ *   underrun. Initialising at target keeps error=0 at re-arm so the
+ *   integrator only fires for sustained drift, not transient overshoot.
+ *   Post-underrun extra fill is left to drain naturally via real clock
+ *   drift; the residual elevated buffer is a feature (more headroom,
+ *   fewer next underruns).
  */
 const DEFAULT_TARGET_FRAMES = 1440;  // 30 ms @ 48 kHz
 const MIN_TARGET_FRAMES = 240;       //  5 ms @ 48 kHz
@@ -175,7 +185,12 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
     // masquerade as drift. Initialise the LP to the current fill on first
     // tick (and after every re-arm) to skip the long startup transient.
     if (!this._filledLpInit) {
-      this._filledLp = this._filled;
+      // v1.0.19: init at target, not _filled. After an underrun, _filled
+      // at re-arm includes the queued-burst overshoot; treating that
+      // overshoot as the LP starting point made the integrator dump skips
+      // to "fix" it. With LP=target at re-arm, the integrator stays quiet
+      // until real drift accumulates.
+      this._filledLp = this.currentTargetFrames;
       this._filledLpInit = true;
     } else {
       this._filledLp += DRIFT_FILL_ALPHA * (this._filled - this._filledLp);

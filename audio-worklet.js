@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC AudioWorklet v1.0.21.
+ * VDO.Ninja Lossless DC AudioWorklet v1.0.22.
  *
  * GENERATED FILE — do not edit by hand. Regenerate via:
  *   npm run build:worklet
@@ -63,6 +63,7 @@ const MAX_TARGET_FRAMES = 14400;     // 300 ms @ 48 kHz
 const REARM_UNDERRUN_TICKS = 8;
 const BUFFER_STATUS_TICKS = 50;
 const CONCEAL_FADE_FRAMES = 32;      // ~0.67 ms @ 48 kHz — RemSound ConcealFadeFramesShort.
+const CLICK_TRIM_FADE_FRAMES = 32;   // Crossfade span for the click-trim splice (same shape).
 
 // Drift integrator constants (RemSound SessionPlayout.cs, 2026-05-06).
 const DRIFT_GAIN_BASE = 0.005;
@@ -105,6 +106,19 @@ class PlayoutChain {
     this._fadeInOnNextRead = false;
     this._lastPacketFrames = DEFAULT_PACKET_FRAMES;
     this._rearmTrimFrames = 0;
+
+    // Click-trim (RemSound SessionPlayout.cs, Phase-4 safety net). Fires when
+    // fill exceeds target + trimMargin so the latency contract is preserved
+    // when concealment, write bursts, or any other accumulation pushed the
+    // ring beyond what the drift integrator can drain in a tolerable window.
+    // Caller can override the margin; default scales with target so small
+    // targets (low-latency mode) snap sooner and large targets absorb more.
+    this._clickTrimMarginFrames = o.clickTrimMarginFrames != null
+      ? Math.max(0, Math.round(o.clickTrimMarginFrames))
+      : null;  // null = compute lazily from current target + packet size.
+    this._clickTrimFrames = 0;
+    this._clickTrimFires = 0;
+    this._pendingClickTrimXfade = false;
 
     // Drift integrator state. Resets on every (re-)arm.
     this._driftAcc = 0;
@@ -173,8 +187,59 @@ class PlayoutChain {
       driftHoldTicks: this._driftHoldTicks,
       driftEventCooldownTicks: this._driftEventCooldownTicks,
       rearmTrimFrames: this._rearmTrimFrames,
+      clickTrimFrames: this._clickTrimFrames,
+      clickTrimFires: this._clickTrimFires,
+      clickTrimThreshold: this.currentTargetFrames + this._effectiveClickTrimMargin(),
       lastPacketFrames: this._lastPacketFrames,
     };
+  }
+
+  _effectiveClickTrimMargin() {
+    if (this._clickTrimMarginFrames != null) return this._clickTrimMarginFrames;
+    // Default margin: max(packetFrames, currentTargetFrames). Matches RemSound's
+    // floorMargin + knob-extra pattern: packet-size floor so the natural
+    // arrival sawtooth doesn't false-trim, plus a target-sized headroom so the
+    // drift integrator has room to drain small overhead before the snap fires.
+    return Math.max(this._lastPacketFrames, this.currentTargetFrames);
+  }
+
+  _applyClickTrimIfNeeded() {
+    const margin = this._effectiveClickTrimMargin();
+    const threshold = this.currentTargetFrames + margin;
+    if (this._filled <= threshold) return false;
+    // Snap _readPos forward, but leave a packet-half cushion above target so
+    // the post-trim sawtooth oscillates AROUND target instead of dropping
+    // below it. Without the cushion, trim cuts the burst peaks down to
+    // target, the drain phase between bursts pulls fill below target, and
+    // the drift integrator sees a persistent deficit and fires repeats —
+    // an oscillation that defeats the whole point of the trim.
+    const cushion = Math.max(0, Math.round(this._lastPacketFrames / 2));
+    const keep = this.currentTargetFrames + cushion;
+    const dropped = this._filled - keep;
+    this._readPos = (this._writePos - keep + this._ringSize) % this._ringSize;
+    this._filled = keep;
+    this._clickTrimFrames += dropped;
+    this._clickTrimFires++;
+    // The next render quantum needs a crossfade between the pre-trim last
+    // sample (already in _lastOutSample) and the new read position, to mask
+    // the splice discontinuity. Renderer handles the actual blend.
+    this._pendingClickTrimXfade = true;
+    // Reset drift state: the snap restored fill to target, so the integrator's
+    // view of "error" is now zero and any accumulator from before is stale.
+    this._driftAcc = 0;
+    this._filledLpInit = false;
+    this._driftHoldTicks = DRIFT_REARM_HOLD_TICKS;
+    this._driftEventCooldownTicks = DRIFT_MIN_EVENT_TICKS;
+    this._emit({
+      type: 'click-trim',
+      dropped,
+      totalDropped: this._clickTrimFrames,
+      fires: this._clickTrimFires,
+      filled: this._filled,
+      target: this.currentTargetFrames,
+      threshold,
+    });
+    return true;
   }
 
   _trimStaleFramesForArm() {
@@ -267,6 +332,13 @@ class PlayoutChain {
       return;
     }
 
+    // Click-trim safety net: snap _readPos forward if fill has accumulated
+    // beyond target + margin (gap recovery, sustained burst, etc.). Restores
+    // the latency contract instantly; cosine crossfade in the render block
+    // below masks the splice. Must run BEFORE the drift integrator so the
+    // integrator sees the post-trim state, not the stale overhead.
+    this._applyClickTrimIfNeeded();
+
     // extra: +1 = skip one source frame this quantum (drain by one),
     //        -1 = repeat one frame (grow by one).
     let extra = 0;
@@ -337,6 +409,12 @@ class PlayoutChain {
     const inFadeIn = this._inConcealment || this._fadeInOnNextRead;
     this._inConcealment = false;
     this._fadeInOnNextRead = false;
+    // Click-trim splice xfade: blend pre-trim trailing sample (held in
+    // _lastOutSample) into the first CLICK_TRIM_FADE_FRAMES of the new read
+    // position. Suppresses fade-in (no concealment to fade in from when the
+    // splice was caused by overhead, not silence).
+    const inClickTrimXfade = this._pendingClickTrimXfade && !inFadeIn;
+    this._pendingClickTrimXfade = false;
     const xfadeStart = quantum - DRIFT_XFADE_FRAMES;
     for (let f = 0; f < quantum; f++) {
       const rp = (this._readPos + f) % this._ringSize;
@@ -357,7 +435,14 @@ class PlayoutChain {
         const rc = c < this._channels ? c : this._channels - 1;
         const v = this._ring[rc][rp];
         const blended = w === 0 ? v : ((1 - w) * v + w * this._ring[rc][neighbourIdx]);
-        output[c][f] = blended * preFadeGain;
+        let out = blended * preFadeGain;
+        if (inClickTrimXfade && f < CLICK_TRIM_FADE_FRAMES) {
+          const t = (f + 1) / CLICK_TRIM_FADE_FRAMES;
+          const w2 = (1 - Math.cos(Math.PI * t)) * 0.5;  // 0 → 1 cosine ramp
+          const rc2 = c < this._channels ? c : this._channels - 1;
+          out = (1 - w2) * this._lastOutSample[rc2] + w2 * out;
+        }
+        output[c][f] = out;
       }
     }
     const consumed = quantum + extra;
@@ -400,6 +485,7 @@ if (typeof module !== 'undefined' && module.exports) {
     DRIFT_REARM_HOLD_TICKS,
     DRIFT_MIN_EVENT_TICKS,
     DRIFT_FILL_ALPHA,
+    CLICK_TRIM_FADE_FRAMES,
   };
 }
 

@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.21';
+  const VERSION     = '1.0.22';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
@@ -22,12 +22,33 @@
   const FMT_FLOAT32 = 1;
   const PACKET_FRAMES = 480;
   const MAX_CONCEAL_PACKETS = 12;
+  // --- Profile presets (Step 15c) --------------------------------------------
+  // &dcMode=NAME bundles dcBuffer + dcFrame + dcFormat so the user picks ONE
+  // knob. Individual &dcBuffer / &dcFrame / &dcFormat URL params still work
+  // and override the profile they're set under. If no profile is set, each
+  // individual knob falls back to its own default.
+  const DC_PROFILES = {
+    lowest:  { dcBuffer: 20, dcFrame:  5, dcFormat: 'int16'   },
+    default: { dcBuffer: 30, dcFrame:  5, dcFormat: 'int16'   },
+    robust:  { dcBuffer: 80, dcFrame: 10, dcFormat: 'int16'   },
+    studio:  { dcBuffer: 30, dcFrame:  5, dcFormat: 'float32' },
+  };
+  const _dcMode = (_stringParam(['dcMode']) || '').toLowerCase();
+  const _profile = DC_PROFILES[_dcMode] || {};
   // dcBuffer/losslessBufferMs is the single public target latency: the worklet
   // arms at this fill level and the drift integrator uses it as its setpoint.
   // Default 30 ms — Layer A of the four-layer playout model.
-  const TARGET_BUFFER_MS = _numberParam(['dcBuffer', 'losslessBufferMs'], 30, 5, 300);
+  const TARGET_BUFFER_MS = _numberParam(['dcBuffer', 'losslessBufferMs'], _profile.dcBuffer || 30, 5, 300);
   const TARGET_BUFFER_FRAMES = Math.round(48000 * TARGET_BUFFER_MS / 1000);
   const STARTUP_PREROLL_PACKETS = Math.round(_numberParam(['losslessPreroll'], 2, 1, 10));
+  // Receiver-requested wire packet size + format, sent in the ack so the
+  // publisher chunks per peer. Per-peer-independent: two listeners can ask
+  // for different sizes and the publisher tailors its DC output to each.
+  const REQUESTED_FRAME_MS = _numberParam(['dcFrame'], _profile.dcFrame || 10, 1, 100);
+  const REQUESTED_FORMAT = (() => {
+    const fmt = (_stringParam(['dcFormat']) || _profile.dcFormat || 'int16').toLowerCase();
+    return (fmt === 'float32' || fmt === 'int16') ? fmt : 'int16';
+  })();
 
   function log(msg)  { console.log(`[lossless-dc v${VERSION}] ${msg}`); }
   function warn(msg) { console.warn(`[lossless-dc v${VERSION}] ${msg}`); }
@@ -57,6 +78,37 @@
       if (Number.isFinite(n)) return Math.max(min, Math.min(max, n));
     }
     return fallback;
+  }
+
+  function _stringParam(names) {
+    try {
+      const pageParams = new URLSearchParams(window.location.search);
+      for (const name of names) {
+        const v = pageParams.get(name);
+        if (v) return v;
+      }
+      for (const [, val] of pageParams) {
+        if (val && val.includes('viewer.js')) {
+          try {
+            const scriptUrl = new URL(val, window.location.href);
+            for (const name of names) {
+              const v = scriptUrl.searchParams.get(name);
+              if (v) return v;
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    try {
+      if (document.currentScript && document.currentScript.src) {
+        const scriptUrl = new URL(document.currentScript.src, window.location.href);
+        for (const name of names) {
+          const v = scriptUrl.searchParams.get(name);
+          if (v) return v;
+        }
+      }
+    } catch (_) {}
+    return null;
   }
 
   // -------------------------------------------------------------------------
@@ -189,10 +241,16 @@
 
   function _sendLosslessAck(peer) {
     if (peer.ackSent || !peer.handshake || peer.handshake.v < 2) return;
+    // Carry receiver's own preferences. Publisher's hs default is 10ms /
+    // int16; only include overrides where this viewer differs, so a default
+    // viewer still sends a minimal ack (forwards-compat).
+    const ack = { v: 2, type: 'ack', lossless: true };
+    if (REQUESTED_FRAME_MS !== 10) ack.frameMs = REQUESTED_FRAME_MS;
+    if (REQUESTED_FORMAT !== 'int16') ack.format = REQUESTED_FORMAT;
     try {
-      peer.dc.send(JSON.stringify({ v: 2, type: 'ack', lossless: true }));
+      peer.dc.send(JSON.stringify(ack));
       peer.ackSent = true;
-      log('Ack sent to publisher');
+      log(`Ack sent to publisher (${ack.frameMs || 10}ms ${ack.format || 'int16'})`);
     } catch (_) {}
   }
 
@@ -437,7 +495,10 @@
   };
 
   log('RTCPeerConnection prototype patched — lossless DC ready');
-  log(`Latency profile: dcBuffer=${TARGET_BUFFER_MS}ms (target=${TARGET_BUFFER_FRAMES} frames) losslessPreroll=${STARTUP_PREROLL_PACKETS}`);
+  log(`Latency profile: ${_dcMode ? `dcMode=${_dcMode} → ` : ''}` +
+    `dcBuffer=${TARGET_BUFFER_MS}ms (target=${TARGET_BUFFER_FRAMES} frames) ` +
+    `dcFrame=${REQUESTED_FRAME_MS}ms dcFormat=${REQUESTED_FORMAT} ` +
+    `losslessPreroll=${STARTUP_PREROLL_PACKETS}`);
 
   // -------------------------------------------------------------------------
   // Overlay — keyboard-accessible status panel + persistent Disable/Retry buttons.

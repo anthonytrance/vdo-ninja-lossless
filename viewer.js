@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC Viewer v1.0.21
+ * VDO.Ninja Lossless DC Viewer v1.0.23
  *
  * Inject via:  &js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
  *
@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.22';
+  const VERSION     = '1.0.23';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
@@ -140,7 +140,7 @@
              savedVolume: 1.0, gainNode: null,
              lastFrameMs: 0, lastSeq: -1,
              frames: 0, seqDrops: 0, audioUnderruns: 0, concealed: 0,
-             driftSkips: 0, driftRepeats: 0, rearmTrimFrames: 0,
+             driftSkips: 0, driftRepeats: 0, rearmTrimFrames: 0, clickTrimFrames: 0,
              bytes: 0, opusRestored: false, bufferFrames: 0,
              lastGoodFrame: null,
              armed: false, losslessStarted: false, startupQueue: [],
@@ -227,6 +227,11 @@
       }
       if (m.type === 'rearm-trim') {
         peer.rearmTrimFrames = m.totalDropped || 0;
+        if (typeof m.filled === 'number') peer.bufferFrames = m.filled;
+        _updateOverlay();
+      }
+      if (m.type === 'click-trim') {
+        peer.clickTrimFrames = m.totalDropped || 0;
         if (typeof m.filled === 'number') peer.bufferFrames = m.filled;
         _updateOverlay();
       }
@@ -549,7 +554,7 @@
     _overlay.appendChild(_stateNode);
 
     _statsNode = document.createElement('div');
-    _statsNode.textContent = 'Frames: 0  SeqDrops: 0  AudioUnderruns: 0  Conceal: 0  Drift: 0/0  RearmTrim: 0ms  Buffer: 0/0 armed 0ms / target 0ms  ~0 kbps';
+    _statsNode.textContent = 'Frames: 0  SeqDrops: 0  AudioUnderruns: 0 (0/min)  Drift: 0/0 (0/min)  RearmTrim: 0ms (0/min)  ClickTrim: 0ms (0/min)  Buffer: 0/0 armed 0ms / target 0ms  ~0 kbps';
     _overlay.appendChild(_statsNode);
 
     const btnRow = document.createElement('div');
@@ -591,11 +596,31 @@
     return 'IDLE';
   }
 
+  // 60s sliding-window snapshot ring for per-minute rate display. Each entry is
+  // {ts, au, df, rt, ct} cumulative counters at that instant. We compare the
+  // newest snapshot to whichever oldest snapshot is still within the 60s window;
+  // the delta is the "per minute" rate (or proportionally less if the session
+  // is younger than 60s).
+  const _rateSnapshots = [];
+  function _sampleRate(now, au, df, rt, ct) {
+    _rateSnapshots.push({ ts: now, au, df, rt, ct });
+    const cutoff = now - 60000;
+    while (_rateSnapshots.length > 1 && _rateSnapshots[0].ts < cutoff) _rateSnapshots.shift();
+  }
+  function _ratePerMin(now, currentValue, key) {
+    if (_rateSnapshots.length < 2) return 0;
+    const oldest = _rateSnapshots[0];
+    const dt = now - oldest.ts;
+    if (dt <= 0) return 0;
+    const delta = currentValue - oldest[key];
+    return Math.round((delta * 60000) / dt);
+  }
+
   function _updateOverlay() {
     _ensureOverlay();
     if (!_overlay) return;
     let totalFrames = 0, totalSeqDrops = 0, totalAudioUnderruns = 0, totalConcealed = 0;
-    let totalDriftSkips = 0, totalDriftRepeats = 0, totalRearmTrimFrames = 0;
+    let totalDriftSkips = 0, totalDriftRepeats = 0, totalRearmTrimFrames = 0, totalClickTrimFrames = 0;
     let totalBytes = 0, armedCount = 0, losslessPeers = 0, minBufferFrames = null, maxTargetFrames = 0;
     for (const [, p] of _peers) {
       if (!p.handshake) continue;
@@ -606,13 +631,14 @@
       totalDriftSkips   += p.driftSkips;
       totalDriftRepeats += p.driftRepeats;
       totalRearmTrimFrames += p.rearmTrimFrames || 0;
+      totalClickTrimFrames += p.clickTrimFrames || 0;
       totalBytes     += p.bytes;
       losslessPeers++;
       if (p.armed) armedCount++;
       if (p.bufferFrames > 0) minBufferFrames = minBufferFrames === null ? p.bufferFrames : Math.min(minBufferFrames, p.bufferFrames);
       if (typeof p.targetFrames === 'number' && p.targetFrames > maxTargetFrames) maxTargetFrames = p.targetFrames;
     }
-    const elapsed  = totalFrames * 0.01;
+    const elapsed  = totalFrames * (REQUESTED_FRAME_MS / 1000);
     const kbps     = elapsed > 0 ? Math.round((totalBytes * 8) / elapsed / 1000) : 0;
     const stateStr = _computeStateStr();
 
@@ -620,7 +646,17 @@
     const bufMs = minBufferFrames === null ? 0 : Math.round((minBufferFrames / 48));
     const targetMs = maxTargetFrames > 0 ? Math.round(maxTargetFrames / 48) : TARGET_BUFFER_MS;
     const rearmTrimMs = Math.round(totalRearmTrimFrames / 48);
-    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  SeqDrops: ${totalSeqDrops}  AudioUnderruns: ${totalAudioUnderruns}  Conceal: ${totalConcealed}  Drift: ${totalDriftSkips}/${totalDriftRepeats}  RearmTrim: ${rearmTrimMs}ms  Buffer: ${armedCount}/${losslessPeers} armed ${bufMs}ms / target ${targetMs}ms  ~${kbps} kbps`;
+    const clickTrimMs = Math.round(totalClickTrimFrames / 48);
+    const totalDriftEvents = totalDriftSkips + totalDriftRepeats;
+    const now = Date.now();
+    _sampleRate(now, totalAudioUnderruns, totalDriftEvents, totalRearmTrimFrames, totalClickTrimFrames);
+    const auPerMin = _ratePerMin(now, totalAudioUnderruns, 'au');
+    const dfPerMin = _ratePerMin(now, totalDriftEvents, 'df');
+    const rtPerMinFrames = _ratePerMin(now, totalRearmTrimFrames, 'rt');
+    const ctPerMinFrames = _ratePerMin(now, totalClickTrimFrames, 'ct');
+    const rtPerMinMs = Math.round(rtPerMinFrames / 48);
+    const ctPerMinMs = Math.round(ctPerMinFrames / 48);
+    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  SeqDrops: ${totalSeqDrops}  AudioUnderruns: ${totalAudioUnderruns} (${auPerMin}/min)  Drift: ${totalDriftSkips}/${totalDriftRepeats} (${dfPerMin}/min)  RearmTrim: ${rearmTrimMs}ms (${rtPerMinMs}ms/min)  ClickTrim: ${clickTrimMs}ms (${ctPerMinMs}ms/min)  Buffer: ${armedCount}/${losslessPeers} armed ${bufMs}ms / target ${targetMs}ms  ~${kbps} kbps`;
 
     // Conditional visibility — Disable when lossless is playing, Retry when Opus is.
     if (_disableBtn) {
@@ -690,7 +726,7 @@
     for (const [, p] of _peers) {
       if (!p.handshake || p.frames === 0) continue;
       const age = now - p.lastFrameMs;
-      log(`stats: frames=${p.frames} seqDrops=${p.seqDrops} audioUnderruns=${p.audioUnderruns} concealed=${p.concealed} buffer=${p.bufferFrames}f ~${Math.round((p.bytes * 8) / (p.frames * 0.01) / 1000)}kbps state=${age < FALLBACK_MS ? 'active' : 'silent'} lastFrame=${age}ms ago`);
+      log(`stats: frames=${p.frames} seqDrops=${p.seqDrops} audioUnderruns=${p.audioUnderruns} concealed=${p.concealed} buffer=${p.bufferFrames}f ~${Math.round((p.bytes * 8) / (p.frames * REQUESTED_FRAME_MS / 1000) / 1000)}kbps state=${age < FALLBACK_MS ? 'active' : 'silent'} lastFrame=${age}ms ago`);
     }
     _updateOverlay();
   }, 1000);

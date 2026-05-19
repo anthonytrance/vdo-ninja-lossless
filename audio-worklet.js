@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC AudioWorklet v1.0.27.
+ * VDO.Ninja Lossless DC AudioWorklet v1.0.28.
  *
  * GENERATED FILE — do not edit by hand. Regenerate via:
  *   npm run build:worklet
@@ -25,6 +25,7 @@
  *   v1.0.25: bounded rate estimator, arm cushion, and partial-shortfall clamp.
  *   v1.0.26: freeze at trusted ratio, disable fill-driven ppm nudging, confirm learning.
  *   v1.0.27: keep long-term clock learning alive through playout disturbances.
+ *   v1.0.28: expose drift learner measured/pending ratios for diagnostics.
  */
 
 'use strict';
@@ -87,8 +88,8 @@ const DRIFT_FILL_ALPHA = 0.0025;
 // Fixed-ratio resampler drift correction. Ratio > 1 consumes input faster,
 // ratio < 1 stretches input. The counter window estimates sender/receiver
 // clock ratio. Buffer-fill error is diagnostic only; it must not modulate pitch.
-const RESAMPLER_WINDOW_SEC = 60.0;
-const RESAMPLER_FIRST_WINDOW_SEC = 60.0;
+const RESAMPLER_WINDOW_SEC = 30.0;
+const RESAMPLER_FIRST_WINDOW_SEC = 30.0;
 const RESAMPLER_RATIO_SMOOTHING_NEW = 0.15;
 const RESAMPLER_RATIO_MIN = 0.995;       // +/-5000 ppm sanity reject.
 const RESAMPLER_RATIO_MAX = 1.005;
@@ -342,32 +343,62 @@ class PlayoutChain {
     this._pendingRateConfirmations = 0;
   }
 
-  _acceptMeasuredRate(measured) {
+  _decayPendingRate() {
+    if (this._pendingRateConfirmations <= 0) return;
+    this._pendingRateConfirmations -= 0.5;
+    if (this._pendingRateConfirmations <= 0) this._clearPendingRate();
+  }
+
+  _emitResamplerStatus(source) {
+    this._emit({
+      type: 'resampler',
+      ratio: this._appliedRateRatio,
+      baseRatio: this._baseRateRatio,
+      trustedRatio: this._trustedRateRatio,
+      measuredRatio: this._measuredRateRatio,
+      pendingRatio: this._pendingRateRatio,
+      pendingConfirmations: this._pendingRateConfirmations,
+      targetRatio: this._targetRateRatio,
+      stableSec: this._stableRenderFrames / this.sampleRate,
+      active: this._resamplerActivelyTracking,
+      updates: this._resamplerUpdates,
+      source: source || 'counter',
+      filled: this._filled,
+      target: this.currentTargetFrames,
+    });
+  }
+
+  _acceptMeasuredRate(measured, outputDelta, opts) {
+    const options = opts || {};
     const measuredPpm = Math.abs((measured - 1.0) * 1e6);
     if (measured < RESAMPLER_RATIO_MIN || measured > RESAMPLER_RATIO_MAX
         || measuredPpm > RESAMPLER_MEASURED_MAX_PPM) {
-      this._clearPendingRate();
+      this._decayPendingRate();
       return false;
     }
 
     const trusted = this._trustedRateRatio;
     if (measuredPpm < RESAMPLER_MEASURED_DEADBAND_PPM) {
       this._measuredRateRatio = trusted;
-      this._clearPendingRate();
+      this._decayPendingRate();
       return false;
     }
 
     const deltaPpm = (measured - trusted) * 1e6;
     if (Math.abs(deltaPpm) < RESAMPLER_MEASURED_DEADBAND_PPM) {
       this._measuredRateRatio = trusted;
-      this._clearPendingRate();
+      this._decayPendingRate();
       return false;
     }
 
     if (this._pendingRateConfirmations > 0) {
       const pendingDeltaPpm = (this._pendingRateRatio - trusted) * 1e6;
+      const packetQuantizationPpm = !options.skipPacketQuantization && outputDelta > 0
+        ? (this._lastPacketFrames / outputDelta) * 1e6
+        : 0;
+      const agreePpm = Math.max(RESAMPLER_LEARN_AGREE_PPM, packetQuantizationPpm * 1.25);
       const agree = Math.sign(deltaPpm) === Math.sign(pendingDeltaPpm)
-        && Math.abs((measured - this._pendingRateRatio) * 1e6) <= RESAMPLER_LEARN_AGREE_PPM;
+        && Math.abs((measured - this._pendingRateRatio) * 1e6) <= agreePpm;
       if (agree) {
         this._pendingRateRatio = (this._pendingRateRatio * this._pendingRateConfirmations + measured)
           / (this._pendingRateConfirmations + 1);
@@ -407,6 +438,14 @@ class PlayoutChain {
     return true;
   }
 
+  applyExternalRateEstimate(ratio) {
+    if (!Number.isFinite(ratio) || ratio <= 0) return false;
+    if (this._stableRenderFrames < this.sampleRate * RESAMPLER_STABLE_HOLD_SEC) return false;
+    const accepted = this._acceptMeasuredRate(ratio, 0, { skipPacketQuantization: true });
+    if (accepted) this._emitResamplerStatus('arrival');
+    return accepted;
+  }
+
   _updateResamplerRate(quantum) {
     if (!this._rateWindowActive) this._resetRateEstimator();
 
@@ -434,17 +473,8 @@ class PlayoutChain {
       const writtenDelta = this._framesWrittenForRate - this._rateWindowStartWritten;
       if (outputDelta > 0 && writtenDelta > 0) {
         const measured = writtenDelta / outputDelta;
-        if (this._acceptMeasuredRate(measured)) {
-          this._emit({
-            type: 'resampler',
-            ratio: this._appliedRateRatio,
-            baseRatio: this._baseRateRatio,
-            measuredRatio: this._measuredRateRatio,
-            targetRatio: this._targetRateRatio,
-            updates: this._resamplerUpdates,
-            filled: this._filled,
-            target: this.currentTargetFrames,
-          });
+        if (this._acceptMeasuredRate(measured, outputDelta)) {
+          this._emitResamplerStatus('counter');
         }
       }
       this._rateWindowStartOutput = this._framesOutputForRate;
@@ -595,7 +625,13 @@ class PlayoutChain {
       target: this.currentTargetFrames,
       ratio: this._appliedRateRatio,
       baseRatio: this._baseRateRatio,
+      trustedRatio: this._trustedRateRatio,
       targetRatio: this._targetRateRatio,
+      measuredRatio: this._measuredRateRatio,
+      pendingRatio: this._pendingRateRatio,
+      pendingConfirmations: this._pendingRateConfirmations,
+      stableSec: this._stableRenderFrames / this.sampleRate,
+      active: this._resamplerActivelyTracking,
       updates: this._resamplerUpdates,
     });
   }
@@ -800,6 +836,8 @@ class LosslessAudioProcessor extends AudioWorkletProcessor {
         this._playout.enqueue(m.samples, m.channels);
       } else if (m.type === 'setTarget') {
         this._playout.setTarget(m.frames);
+      } else if (m.type === 'rateEstimate') {
+        this._playout.applyExternalRateEstimate(m.ratio);
       }
     };
   }

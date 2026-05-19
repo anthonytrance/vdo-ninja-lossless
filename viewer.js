@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC Viewer v1.0.27
+ * VDO.Ninja Lossless DC Viewer v1.0.28
  *
  * Inject via:  &js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
  *
@@ -13,7 +13,15 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.27';
+  const VERSION     = '1.0.28';
+  const DEBUG_ON    = (() => {
+    try {
+      const v = (new URLSearchParams(window.location.search)).get('debug');
+      return v === '1' || v === 'true';
+    } catch (_) {
+      return false;
+    }
+  })();
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
@@ -21,6 +29,15 @@
   const FMT_INT16   = 0;
   const FMT_FLOAT32 = 1;
   const MAX_CONCEAL_PACKETS = 12;
+  const ARRIVAL_ESTIMATOR_MAX_WINDOW_MS = 35000;
+  const ARRIVAL_ESTIMATOR_MIN_SPAN_MS = 8000;
+  const ARRIVAL_RATE_CONTROL_MIN_SPAN_SEC = 14;
+  const ARRIVAL_RATE_CONTROL_MIN_AGE_MS = 20000;
+  const ARRIVAL_RATE_CONTROL_MAX_JITTER_MS = 1.5;
+  const ARRIVAL_RATE_CONTROL_DEADBAND_PPM = 40;
+  const ARRIVAL_RATE_CONTROL_MAX_PPM = 500;
+  const ARRIVAL_RATE_CONTROL_AGREE_PPM = 100;
+  const ARRIVAL_RATE_CONTROL_INTERVAL_MS = 1000;
   // --- Profile presets (Step 15c) --------------------------------------------
   // &dcMode=NAME bundles dcBuffer + dcFrame + dcFormat so the user picks ONE
   // knob. Individual &dcBuffer / &dcFrame / &dcFormat URL params still work
@@ -157,6 +174,21 @@
              driftSkips: 0, driftRepeats: 0, rearmTrimFrames: 0, clickTrimFrames: 0,
              bytes: 0, opusRestored: false, bufferFrames: 0,
              resamplerRatio: 1.0, resamplerUpdates: 0,
+             resamplerBaseRatio: 1.0, resamplerTrustedRatio: 1.0,
+             resamplerMeasuredRatio: 1.0, resamplerPendingRatio: 1.0,
+             resamplerPendingConfirmations: 0, resamplerTargetRatio: 1.0,
+             resamplerStableSec: 0, resamplerActive: false, resamplerSource: '',
+             arrivalSamples: [], arrivalLastSeq: -1, arrivalSenderFrames: 0,
+             arrivalStartMs: 0,
+             arrivalRatio15: 1.0, arrivalRatio30: 1.0,
+             arrivalJitterMs15: 0, arrivalJitterMs30: 0,
+             arrivalSpanSec15: 0, arrivalSpanSec30: 0,
+             arrivalSamples15: 0, arrivalSamples30: 0,
+             arrivalValid15: false, arrivalValid30: false,
+             arrivalSeqGaps: 0, arrivalResets: 0,
+             arrivalControlPendingRatio: 1.0, arrivalControlConfirmations: 0,
+             arrivalControlPendingMs: 0, arrivalControlLastSendMs: 0,
+             arrivalControlSentRatio: 1.0, arrivalControlActive: false,
              lastGoodFrame: null, packetFrames: REQUESTED_FRAME_FRAMES,
              armed: false, losslessStarted: false, startupQueue: [],
              pollTimer: null };
@@ -232,13 +264,11 @@
       }
       if (m.type === 'buffer') {
         peer.bufferFrames = m.filled || 0;
-        if (typeof m.ratio === 'number') peer.resamplerRatio = m.ratio;
-        if (typeof m.updates === 'number') peer.resamplerUpdates = m.updates;
+        _updatePeerResamplerStats(peer, m);
         _updateOverlay();
       }
       if (m.type === 'resampler') {
-        if (typeof m.ratio === 'number') peer.resamplerRatio = m.ratio;
-        if (typeof m.updates === 'number') peer.resamplerUpdates = m.updates;
+        _updatePeerResamplerStats(peer, m);
         if (typeof m.filled === 'number') peer.bufferFrames = m.filled;
         _updateOverlay();
       }
@@ -267,6 +297,218 @@
     peer.gainNode.connect(_audioCtx.destination);
     _workletNodes.set(peer.pc, wn);
     log(`AudioWorkletNode created (${channels}ch)`);
+  }
+
+  function _updatePeerResamplerStats(peer, m) {
+    if (typeof m.ratio === 'number') peer.resamplerRatio = m.ratio;
+    if (typeof m.baseRatio === 'number') peer.resamplerBaseRatio = m.baseRatio;
+    if (typeof m.trustedRatio === 'number') peer.resamplerTrustedRatio = m.trustedRatio;
+    if (typeof m.measuredRatio === 'number') peer.resamplerMeasuredRatio = m.measuredRatio;
+    if (typeof m.pendingRatio === 'number') peer.resamplerPendingRatio = m.pendingRatio;
+    if (typeof m.pendingConfirmations === 'number') peer.resamplerPendingConfirmations = m.pendingConfirmations;
+    if (typeof m.targetRatio === 'number') peer.resamplerTargetRatio = m.targetRatio;
+    if (typeof m.stableSec === 'number') peer.resamplerStableSec = m.stableSec;
+    if (typeof m.active === 'boolean') peer.resamplerActive = m.active;
+    if (typeof m.updates === 'number') peer.resamplerUpdates = m.updates;
+    if (typeof m.source === 'string') peer.resamplerSource = m.source;
+  }
+
+  function _resetArrivalEstimator(peer) {
+    peer.arrivalSamples = [];
+    peer.arrivalLastSeq = -1;
+    peer.arrivalSenderFrames = 0;
+    peer.arrivalStartMs = 0;
+    peer.arrivalRatio15 = 1.0;
+    peer.arrivalRatio30 = 1.0;
+    peer.arrivalJitterMs15 = 0;
+    peer.arrivalJitterMs30 = 0;
+    peer.arrivalSpanSec15 = 0;
+    peer.arrivalSpanSec30 = 0;
+    peer.arrivalSamples15 = 0;
+    peer.arrivalSamples30 = 0;
+    peer.arrivalValid15 = false;
+    peer.arrivalValid30 = false;
+    peer.arrivalControlPendingRatio = 1.0;
+    peer.arrivalControlConfirmations = 0;
+    peer.arrivalControlPendingMs = 0;
+    peer.arrivalControlLastSendMs = 0;
+    peer.arrivalControlSentRatio = 1.0;
+    peer.arrivalControlActive = false;
+  }
+
+  function _updateArrivalEstimator(peer, seq, packetFrames) {
+    const frames = packetFrames > 0 ? packetFrames : (peer.packetFrames || REQUESTED_FRAME_FRAMES);
+    if (!Number.isFinite(frames) || frames <= 0) return;
+    const nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    if (!peer.arrivalSamples) peer.arrivalSamples = [];
+
+    if (peer.arrivalLastSeq < 0) {
+      peer.arrivalLastSeq = seq;
+      peer.arrivalSenderFrames = 0;
+      peer.arrivalStartMs = nowMs;
+    } else {
+      const diff = (seq - peer.arrivalLastSeq + 65536) & 0xFFFF;
+      if (diff === 0 || diff > 32768) {
+        peer.arrivalResets = (peer.arrivalResets || 0) + 1;
+        _resetArrivalEstimator(peer);
+        peer.arrivalLastSeq = seq;
+        peer.arrivalSenderFrames = 0;
+      } else {
+        if (diff > 1) peer.arrivalSeqGaps = (peer.arrivalSeqGaps || 0) + diff - 1;
+        peer.arrivalSenderFrames += diff * frames;
+        peer.arrivalLastSeq = seq;
+      }
+    }
+
+    peer.arrivalSamples.push({ t: nowMs, f: peer.arrivalSenderFrames });
+    const cutoff = nowMs - ARRIVAL_ESTIMATOR_MAX_WINDOW_MS;
+    while (peer.arrivalSamples.length > 1 && peer.arrivalSamples[0].t < cutoff) {
+      peer.arrivalSamples.shift();
+    }
+
+    _refreshArrivalEstimator(peer, nowMs);
+    _maybeSendArrivalRateEstimate(peer, nowMs);
+  }
+
+  function _refreshArrivalEstimator(peer, nowMs) {
+    const s15 = _arrivalWindowStats(peer, nowMs, 15000);
+    const s30 = _arrivalWindowStats(peer, nowMs, 30000);
+    _storeArrivalWindow(peer, 15, s15);
+    _storeArrivalWindow(peer, 30, s30);
+  }
+
+  function _storeArrivalWindow(peer, suffix, stats) {
+    peer[`arrivalValid${suffix}`] = !!stats;
+    peer[`arrivalRatio${suffix}`] = stats ? stats.ratio : 1.0;
+    peer[`arrivalJitterMs${suffix}`] = stats ? stats.jitterMs : 0;
+    peer[`arrivalSpanSec${suffix}`] = stats ? stats.spanSec : 0;
+    peer[`arrivalSamples${suffix}`] = stats ? stats.count : 0;
+  }
+
+  function _arrivalWindowStats(peer, nowMs, windowMs) {
+    const samples = peer.arrivalSamples || [];
+    const cutoff = nowMs - windowMs;
+    let start = 0;
+    while (start < samples.length - 1 && samples[start].t < cutoff) start++;
+    const count = samples.length - start;
+    if (count < 4) return null;
+
+    const first = samples[start];
+    const last = samples[samples.length - 1];
+    const spanMs = last.t - first.t;
+    if (spanMs < ARRIVAL_ESTIMATOR_MIN_SPAN_MS) return null;
+
+    let sumT = 0, sumF = 0;
+    for (let i = start; i < samples.length; i++) {
+      sumT += samples[i].t - first.t;
+      sumF += samples[i].f - first.f;
+    }
+    const meanT = sumT / count;
+    const meanF = sumF / count;
+
+    let cov = 0, varT = 0;
+    for (let i = start; i < samples.length; i++) {
+      const dt = (samples[i].t - first.t) - meanT;
+      const df = (samples[i].f - first.f) - meanF;
+      cov += dt * df;
+      varT += dt * dt;
+    }
+    if (varT <= 0) return null;
+
+    const slopeFramesPerMs = cov / varT;
+    const sampleRate = (peer.handshake && peer.handshake.sampleRate) || 48000;
+    const nominalFramesPerMs = sampleRate / 1000;
+    const ratio = slopeFramesPerMs / nominalFramesPerMs;
+    if (!Number.isFinite(ratio) || ratio <= 0) return null;
+
+    let sse = 0;
+    for (let i = start; i < samples.length; i++) {
+      const t = samples[i].t - first.t;
+      const f = samples[i].f - first.f;
+      const residualFrames = f - (meanF + slopeFramesPerMs * (t - meanT));
+      sse += residualFrames * residualFrames;
+    }
+    return {
+      ratio,
+      jitterMs: Math.sqrt(sse / count) / nominalFramesPerMs,
+      spanSec: spanMs / 1000,
+      count,
+    };
+  }
+
+  function _resetArrivalControl(peer) {
+    peer.arrivalControlPendingRatio = 1.0;
+    peer.arrivalControlConfirmations = 0;
+    peer.arrivalControlPendingMs = 0;
+    peer.arrivalControlActive = false;
+  }
+
+  function _maybeSendArrivalRateEstimate(peer, nowMs) {
+    if (!peer.losslessStarted || !peer.arrivalValid15) {
+      _resetArrivalControl(peer);
+      return;
+    }
+    const wn = _workletNodes.get(peer.pc);
+    if (!wn) return;
+    const ratio = peer.arrivalRatio15;
+    const ppm = (ratio - 1.0) * 1000000;
+    const absPpm = Math.abs(ppm);
+    if (!Number.isFinite(ratio) || ratio <= 0
+        || !peer.arrivalStartMs
+        || nowMs - peer.arrivalStartMs < ARRIVAL_RATE_CONTROL_MIN_AGE_MS
+        || peer.arrivalSpanSec15 < ARRIVAL_RATE_CONTROL_MIN_SPAN_SEC
+        || peer.arrivalJitterMs15 > ARRIVAL_RATE_CONTROL_MAX_JITTER_MS
+        || absPpm < ARRIVAL_RATE_CONTROL_DEADBAND_PPM
+        || absPpm > ARRIVAL_RATE_CONTROL_MAX_PPM) {
+      _resetArrivalControl(peer);
+      return;
+    }
+
+    if (peer.arrivalValid30 && peer.arrivalSpanSec30 >= 25) {
+      const ppm30 = (peer.arrivalRatio30 - 1.0) * 1000000;
+      if (Number.isFinite(ppm30) && Math.abs(ppm - ppm30) > ARRIVAL_RATE_CONTROL_AGREE_PPM * 2) {
+        _resetArrivalControl(peer);
+        return;
+      }
+    }
+
+    if (peer.arrivalControlConfirmations > 0) {
+      const pendingPpm = (peer.arrivalControlPendingRatio - 1.0) * 1000000;
+      const agrees = Math.sign(ppm) === Math.sign(pendingPpm)
+        && Math.abs(ppm - pendingPpm) <= ARRIVAL_RATE_CONTROL_AGREE_PPM;
+      if (!agrees) {
+        peer.arrivalControlPendingRatio = ratio;
+        peer.arrivalControlConfirmations = 1;
+        peer.arrivalControlPendingMs = nowMs;
+        return;
+      }
+      if (nowMs - peer.arrivalControlPendingMs >= ARRIVAL_RATE_CONTROL_INTERVAL_MS) {
+        peer.arrivalControlPendingRatio = (peer.arrivalControlPendingRatio * peer.arrivalControlConfirmations + ratio)
+          / (peer.arrivalControlConfirmations + 1);
+        peer.arrivalControlConfirmations++;
+        peer.arrivalControlPendingMs = nowMs;
+      }
+    } else {
+      peer.arrivalControlPendingRatio = ratio;
+      peer.arrivalControlConfirmations = 1;
+      peer.arrivalControlPendingMs = nowMs;
+      return;
+    }
+
+    if (peer.arrivalControlConfirmations < 2) return;
+    if (nowMs - peer.arrivalControlLastSendMs < ARRIVAL_RATE_CONTROL_INTERVAL_MS) return;
+
+    peer.arrivalControlSentRatio = peer.arrivalControlPendingRatio;
+    peer.arrivalControlLastSendMs = nowMs;
+    peer.arrivalControlActive = true;
+    wn.port.postMessage({
+      type: 'rateEstimate',
+      ratio: peer.arrivalControlSentRatio,
+      source: 'arrival15',
+      ppm: Math.round((peer.arrivalControlSentRatio - 1.0) * 1000000),
+      jitterMs: peer.arrivalJitterMs15,
+      spanSec: peer.arrivalSpanSec15,
+    });
   }
 
   function _sendLosslessAck(peer) {
@@ -456,6 +698,8 @@
         return;
       }
       peer.losslessStarted = true;
+      _resetArrivalEstimator(peer);
+      _updateArrivalEstimator(peer, seq, peer.packetFrames);
       log(`Startup preroll ready (${peer.startupQueue.length} packets) — lossless playback starts`);
       for (const item of peer.startupQueue) _postFrameToWorklet(peer, item.f32, item.byteLength);
       peer.startupQueue = [];
@@ -463,6 +707,7 @@
       return;
     }
 
+    _updateArrivalEstimator(peer, seq, peer.packetFrames);
     _postFrameToWorklet(peer, f32, buf.byteLength);
     _updateOverlay();
   }
@@ -530,8 +775,7 @@
   // the autonomous browser harness can read per-peer state without parsing the
   // overlay text. Non-breaking — production loads don't set this.
   try {
-    const _debugOn = (new URLSearchParams(window.location.search)).get('debug');
-    if (_debugOn === '1' || _debugOn === 'true') {
+    if (DEBUG_ON) {
       window.__LosslessDcDebug = Object.freeze({
         get peers() { return _peers; },
         get version() { return VERSION; },
@@ -554,7 +798,33 @@
               rearmTrimFrames: p.rearmTrimFrames, clickTrimFrames: p.clickTrimFrames,
               bufferFrames: p.bufferFrames, targetFrames: p.targetFrames || 0,
               resamplerRatio: p.resamplerRatio || 1.0,
+              resamplerBaseRatio: p.resamplerBaseRatio || 1.0,
+              resamplerTrustedRatio: p.resamplerTrustedRatio || 1.0,
+              resamplerMeasuredRatio: p.resamplerMeasuredRatio || 1.0,
+              resamplerPendingRatio: p.resamplerPendingRatio || 1.0,
+              resamplerPendingConfirmations: p.resamplerPendingConfirmations || 0,
+              resamplerTargetRatio: p.resamplerTargetRatio || 1.0,
+              resamplerStableSec: p.resamplerStableSec || 0,
+              resamplerActive: !!p.resamplerActive,
               resamplerUpdates: p.resamplerUpdates || 0,
+              resamplerSource: p.resamplerSource || '',
+              arrivalRatio15: p.arrivalRatio15 || 1.0,
+              arrivalRatio30: p.arrivalRatio30 || 1.0,
+              arrivalAgeSec: p.arrivalStartMs ? ((performance.now() - p.arrivalStartMs) / 1000) : 0,
+              arrivalJitterMs15: p.arrivalJitterMs15 || 0,
+              arrivalJitterMs30: p.arrivalJitterMs30 || 0,
+              arrivalSpanSec15: p.arrivalSpanSec15 || 0,
+              arrivalSpanSec30: p.arrivalSpanSec30 || 0,
+              arrivalSamples15: p.arrivalSamples15 || 0,
+              arrivalSamples30: p.arrivalSamples30 || 0,
+              arrivalValid15: !!p.arrivalValid15,
+              arrivalValid30: !!p.arrivalValid30,
+              arrivalSeqGaps: p.arrivalSeqGaps || 0,
+              arrivalResets: p.arrivalResets || 0,
+              arrivalControlPendingRatio: p.arrivalControlPendingRatio || 1.0,
+              arrivalControlConfirmations: p.arrivalControlConfirmations || 0,
+              arrivalControlSentRatio: p.arrivalControlSentRatio || 1.0,
+              arrivalControlActive: !!p.arrivalControlActive,
               lastFrameMs: p.lastFrameMs, lastSeq: p.lastSeq,
             });
           }
@@ -691,6 +961,11 @@
     let totalDriftSkips = 0, totalDriftRepeats = 0, totalRearmTrimFrames = 0, totalClickTrimFrames = 0;
     let totalBytes = 0, armedCount = 0, losslessPeers = 0, minBufferFrames = null, maxTargetFrames = 0;
     let ratioSum = 0, ratioCount = 0, ratioUpdates = 0;
+    let measuredSum = 0, measuredCount = 0, pendingSum = 0, pendingCount = 0;
+    let pendingConfirmations = 0, minStableSec = null, activeRatioPeers = 0;
+    let arrival15Sum = 0, arrival15Count = 0, arrival30Sum = 0, arrival30Count = 0;
+    let arrival15JitterSum = 0, arrival30JitterSum = 0, arrivalSeqGaps = 0;
+    let arrivalControlSentSum = 0, arrivalControlSentCount = 0, arrivalControlConfirmations = 0;
     for (const [, p] of _peers) {
       if (!p.handshake) continue;
       totalFrames    += p.frames;
@@ -711,6 +986,35 @@
         ratioCount++;
       }
       ratioUpdates += p.resamplerUpdates || 0;
+      if (typeof p.resamplerMeasuredRatio === 'number' && p.resamplerMeasuredRatio > 0) {
+        measuredSum += p.resamplerMeasuredRatio;
+        measuredCount++;
+      }
+      if (typeof p.resamplerPendingRatio === 'number' && p.resamplerPendingRatio > 0) {
+        pendingSum += p.resamplerPendingRatio;
+        pendingCount++;
+      }
+      pendingConfirmations = Math.max(pendingConfirmations, p.resamplerPendingConfirmations || 0);
+      if (typeof p.resamplerStableSec === 'number') {
+        minStableSec = minStableSec === null ? p.resamplerStableSec : Math.min(minStableSec, p.resamplerStableSec);
+      }
+      if (p.resamplerActive) activeRatioPeers++;
+      if (p.arrivalValid15 && typeof p.arrivalRatio15 === 'number' && p.arrivalRatio15 > 0) {
+        arrival15Sum += p.arrivalRatio15;
+        arrival15JitterSum += p.arrivalJitterMs15 || 0;
+        arrival15Count++;
+      }
+      if (p.arrivalValid30 && typeof p.arrivalRatio30 === 'number' && p.arrivalRatio30 > 0) {
+        arrival30Sum += p.arrivalRatio30;
+        arrival30JitterSum += p.arrivalJitterMs30 || 0;
+        arrival30Count++;
+      }
+      if (p.arrivalControlActive && typeof p.arrivalControlSentRatio === 'number' && p.arrivalControlSentRatio > 0) {
+        arrivalControlSentSum += p.arrivalControlSentRatio;
+        arrivalControlSentCount++;
+      }
+      arrivalControlConfirmations = Math.max(arrivalControlConfirmations, p.arrivalControlConfirmations || 0);
+      arrivalSeqGaps += p.arrivalSeqGaps || 0;
     }
     const elapsed  = totalFrames * (REQUESTED_FRAME_MS / 1000);
     const kbps     = elapsed > 0 ? Math.round((totalBytes * 8) / elapsed / 1000) : 0;
@@ -723,6 +1027,17 @@
     const clickTrimMs = Math.round(totalClickTrimFrames / 48);
     const totalDriftEvents = totalDriftSkips + totalDriftRepeats;
     const ratioPpm = ratioCount > 0 ? Math.round(((ratioSum / ratioCount) - 1.0) * 1000000) : 0;
+    const measuredPpm = measuredCount > 0 ? Math.round(((measuredSum / measuredCount) - 1.0) * 1000000) : 0;
+    const pendingPpm = pendingCount > 0 ? Math.round(((pendingSum / pendingCount) - 1.0) * 1000000) : 0;
+    const stableSec = minStableSec === null ? 0 : Math.round(minStableSec);
+    const arrival15Ppm = arrival15Count > 0 ? Math.round(((arrival15Sum / arrival15Count) - 1.0) * 1000000) : null;
+    const arrival30Ppm = arrival30Count > 0 ? Math.round(((arrival30Sum / arrival30Count) - 1.0) * 1000000) : null;
+    const arrival15Jitter = arrival15Count > 0 ? Math.round((arrival15JitterSum / arrival15Count) * 10) / 10 : null;
+    const arrival30Jitter = arrival30Count > 0 ? Math.round((arrival30JitterSum / arrival30Count) * 10) / 10 : null;
+    const arrivalControlPpm = arrivalControlSentCount > 0 ? Math.round(((arrivalControlSentSum / arrivalControlSentCount) - 1.0) * 1000000) : null;
+    const learnText = DEBUG_ON
+      ? `  Learn: meas ${measuredPpm}ppm pending ${pendingPpm}ppm/${pendingConfirmations}c stable ${stableSec}s active ${activeRatioPeers}/${losslessPeers} arrival15 ${arrival15Ppm === null ? 'n/a' : `${arrival15Ppm}ppm/${arrival15Jitter}ms`} arrival30 ${arrival30Ppm === null ? 'n/a' : `${arrival30Ppm}ppm/${arrival30Jitter}ms`} sent ${arrivalControlPpm === null ? 'n/a' : `${arrivalControlPpm}ppm/${arrivalControlConfirmations}c`} gaps ${arrivalSeqGaps}`
+      : '';
     const now = Date.now();
     _sampleRate(now, totalAudioUnderruns, totalDriftEvents, totalRearmTrimFrames, totalClickTrimFrames);
     const auPerMin = _ratePerMin(now, totalAudioUnderruns, 'au');
@@ -731,7 +1046,7 @@
     const ctPerMinFrames = _ratePerMin(now, totalClickTrimFrames, 'ct');
     const rtPerMinMs = Math.round(rtPerMinFrames / 48);
     const ctPerMinMs = Math.round(ctPerMinFrames / 48);
-    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  SeqDrops: ${totalSeqDrops}  AudioUnderruns: ${totalAudioUnderruns} (${auPerMin}/min)  Drift: ${totalDriftSkips}/${totalDriftRepeats} (${dfPerMin}/min)  RearmTrim: ${rearmTrimMs}ms (${rtPerMinMs}ms/min)  ClickTrim: ${clickTrimMs}ms (${ctPerMinMs}ms/min)  Buffer: ${armedCount}/${losslessPeers} armed ${bufMs}ms / target ${targetMs}ms  Ratio: ${ratioPpm}ppm/${ratioUpdates}u  ~${kbps} kbps`;
+    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  SeqDrops: ${totalSeqDrops}  AudioUnderruns: ${totalAudioUnderruns} (${auPerMin}/min)  Drift: ${totalDriftSkips}/${totalDriftRepeats} (${dfPerMin}/min)  RearmTrim: ${rearmTrimMs}ms (${rtPerMinMs}ms/min)  ClickTrim: ${clickTrimMs}ms (${ctPerMinMs}ms/min)  Buffer: ${armedCount}/${losslessPeers} armed ${bufMs}ms / target ${targetMs}ms  Ratio: ${ratioPpm}ppm/${ratioUpdates}u${learnText}  ~${kbps} kbps`;
 
     // Conditional visibility — Disable when lossless is playing, Retry when Opus is.
     if (_disableBtn) {
@@ -781,8 +1096,21 @@
       peer.bufferFrames = 0;
       peer.resamplerRatio = 1.0;
       peer.resamplerUpdates = 0;
+      peer.resamplerBaseRatio = 1.0;
+      peer.resamplerTrustedRatio = 1.0;
+      peer.resamplerMeasuredRatio = 1.0;
+      peer.resamplerPendingRatio = 1.0;
+      peer.resamplerPendingConfirmations = 0;
+      peer.resamplerTargetRatio = 1.0;
+      peer.resamplerStableSec = 0;
+      peer.resamplerActive = false;
+      peer.resamplerSource = '';
+      peer.arrivalSeqGaps = 0;
+      peer.arrivalResets = 0;
+      _resetArrivalEstimator(peer);
       peer.lastFrameMs = 0;
       peer.lastSeq = -1;
+      peer.targetFrames = TARGET_BUFFER_FRAMES;
       peer.armed = false;
       peer.losslessStarted = false;
       peer.startupQueue = [];

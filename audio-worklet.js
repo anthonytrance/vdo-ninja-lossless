@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC AudioWorklet v1.0.26.
+ * VDO.Ninja Lossless DC AudioWorklet v1.0.27.
  *
  * GENERATED FILE — do not edit by hand. Regenerate via:
  *   npm run build:worklet
@@ -24,6 +24,7 @@
  *   v1.0.24: fixed-ratio linear resampler replaces steady-state splices.
  *   v1.0.25: bounded rate estimator, arm cushion, and partial-shortfall clamp.
  *   v1.0.26: freeze at trusted ratio, disable fill-driven ppm nudging, confirm learning.
+ *   v1.0.27: keep long-term clock learning alive through playout disturbances.
  */
 
 'use strict';
@@ -86,19 +87,20 @@ const DRIFT_FILL_ALPHA = 0.0025;
 // Fixed-ratio resampler drift correction. Ratio > 1 consumes input faster,
 // ratio < 1 stretches input. The counter window estimates sender/receiver
 // clock ratio. Buffer-fill error is diagnostic only; it must not modulate pitch.
-const RESAMPLER_WINDOW_SEC = 30.0;
-const RESAMPLER_FIRST_WINDOW_SEC = 30.0;
+const RESAMPLER_WINDOW_SEC = 60.0;
+const RESAMPLER_FIRST_WINDOW_SEC = 60.0;
 const RESAMPLER_RATIO_SMOOTHING_NEW = 0.15;
 const RESAMPLER_RATIO_MIN = 0.995;       // +/-5000 ppm sanity reject.
 const RESAMPLER_RATIO_MAX = 1.005;
 const RESAMPLER_MEASURED_MAX_PPM = 500;  // Reject non-clock outliers, not real device drift.
-const RESAMPLER_MEASURED_DEADBAND_PPM = 75;
+const RESAMPLER_MEASURED_DEADBAND_PPM = 40;
 const RESAMPLER_LEARN_CONFIRM_WINDOWS = 2;
 const RESAMPLER_LEARN_AGREE_PPM = 75;
+const RESAMPLER_LEARN_MAX_STEP_PPM = 50;
 const RESAMPLER_FILL_CORRECTION_SEC = 30.0;
 const RESAMPLER_FILL_MAX_PPM = 0;        // Do not let buffer fill modulate pitch.
 const RESAMPLER_RATIO_SLEW = 0.0025;     // About 1 s time constant at 48k/128.
-const RESAMPLER_STABLE_HOLD_SEC = 15.0;
+const RESAMPLER_STABLE_HOLD_SEC = 5.0;
 const LATENCY_TRIM_ARM_SEC = 2.0;
 const LATENCY_TRIM_STABLE_SEC = 0.5;
 
@@ -275,22 +277,14 @@ class PlayoutChain {
   }
 
   _markRateDisturbed() {
-    const trusted = this._trustedRateRatio;
-    this._rateWindowDisturbed = true;
-    this._stableRenderFrames = 0;
+    // A playout disturbance should freeze whatever clock ratio we currently
+    // trust, but it must not erase the long-term written/output measurement.
+    // Otherwise a session with periodic underruns can never learn real device
+    // drift and stays pinned at 0 ppm forever.
     this._renderFramesSinceDisturbance = 0;
-    this._resamplerActivelyTracking = trusted !== 1.0;
-    this._measuredRateRatio = trusted;
-    this._baseRateRatio = trusted;
-    this._targetRateRatio = trusted;
-    this._appliedRateRatio = trusted;
-    this._pendingRateRatio = trusted;
-    this._pendingRateConfirmations = 0;
     this._lastFillCorrectionPpm = 0;
     this._resamplerFillArmed = false;
     this._filledLpInit = false;
-    this._rateWindowStartOutput = this._framesOutputForRate;
-    this._rateWindowStartWritten = this._framesWrittenForRate;
   }
 
   _lowLatencyCushionFrames() {
@@ -393,13 +387,19 @@ class PlayoutChain {
     }
 
     this._measuredRateRatio = this._pendingRateRatio;
+    const previous = this._trustedRateRatio;
+    let next;
     if (!this._resamplerActivelyTracking) {
-      this._baseRateRatio = this._measuredRateRatio;
+      next = this._measuredRateRatio;
       this._resamplerActivelyTracking = true;
     } else {
-      this._baseRateRatio = (1.0 - RESAMPLER_RATIO_SMOOTHING_NEW) * this._baseRateRatio
+      next = (1.0 - RESAMPLER_RATIO_SMOOTHING_NEW) * this._baseRateRatio
         + RESAMPLER_RATIO_SMOOTHING_NEW * this._measuredRateRatio;
     }
+    const maxStep = RESAMPLER_LEARN_MAX_STEP_PPM / 1e6;
+    if (next > previous + maxStep) next = previous + maxStep;
+    else if (next < previous - maxStep) next = previous - maxStep;
+    this._baseRateRatio = next;
     this._trustedRateRatio = this._baseRateRatio;
     this._resamplerFillArmed = true;
     this._resamplerUpdates++;
@@ -432,7 +432,7 @@ class PlayoutChain {
     const windowSec = this._resamplerActivelyTracking ? RESAMPLER_WINDOW_SEC : RESAMPLER_FIRST_WINDOW_SEC;
     if (outputDelta >= this.sampleRate * windowSec) {
       const writtenDelta = this._framesWrittenForRate - this._rateWindowStartWritten;
-      if (!this._rateWindowDisturbed && outputDelta > 0 && writtenDelta > 0) {
+      if (outputDelta > 0 && writtenDelta > 0) {
         const measured = writtenDelta / outputDelta;
         if (this._acceptMeasuredRate(measured)) {
           this._emit({
@@ -652,6 +652,7 @@ class PlayoutChain {
         for (const ch of output) ch.fill(0);
       }
       this._emit({ type: 'underrun', filled: this._filled, needed, target: this.currentTargetFrames });
+      this._framesOutputForRate += quantum;
       this._markRateDisturbed();
       this._resampleFrac = 0;
       this._consecutiveUnderruns++;
@@ -765,6 +766,7 @@ if (typeof module !== 'undefined' && module.exports) {
     RESAMPLER_MEASURED_DEADBAND_PPM,
     RESAMPLER_LEARN_CONFIRM_WINDOWS,
     RESAMPLER_LEARN_AGREE_PPM,
+    RESAMPLER_LEARN_MAX_STEP_PPM,
     RESAMPLER_FILL_CORRECTION_SEC,
     RESAMPLER_FILL_MAX_PPM,
     RESAMPLER_RATIO_SLEW,

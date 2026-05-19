@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC Viewer v1.0.26
+ * VDO.Ninja Lossless DC Viewer v1.0.27
  *
  * Inject via:  &js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
  *
@@ -13,14 +13,13 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.26';
+  const VERSION     = '1.0.27';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
   const FALLBACK_MS = 2000;
   const FMT_INT16   = 0;
   const FMT_FLOAT32 = 1;
-  const PACKET_FRAMES = 480;
   const MAX_CONCEAL_PACKETS = 12;
   // --- Profile presets (Step 15c) --------------------------------------------
   // &dcMode=NAME bundles dcBuffer + dcFrame + dcFormat so the user picks ONE
@@ -158,7 +157,7 @@
              driftSkips: 0, driftRepeats: 0, rearmTrimFrames: 0, clickTrimFrames: 0,
              bytes: 0, opusRestored: false, bufferFrames: 0,
              resamplerRatio: 1.0, resamplerUpdates: 0,
-             lastGoodFrame: null,
+             lastGoodFrame: null, packetFrames: REQUESTED_FRAME_FRAMES,
              armed: false, losslessStarted: false, startupQueue: [],
              pollTimer: null };
   }
@@ -296,7 +295,7 @@
 
   function _concealGap(peer, gap) {
     const count = Math.min(gap, MAX_CONCEAL_PACKETS);
-    const samplesPerPacket = PACKET_FRAMES * (peer.handshake.channels || 2);
+    const samplesPerPacket = (peer.packetFrames || REQUESTED_FRAME_FRAMES) * (peer.handshake.channels || 2);
     for (let i = 0; i < count; i++) {
       const f32 = peer.lastGoodFrame
         ? new Float32Array(peer.lastGoodFrame)
@@ -420,7 +419,9 @@
 
     const view = new DataView(buf);
     const seq  = view.getUint16(0, true);
+    const packetFrames = view.getUint16(2, true);
     const fmt  = view.getUint8(4);
+    if (packetFrames > 0) peer.packetFrames = packetFrames;
 
     if (peer.lastSeq >= 0) {
       const exp = (peer.lastSeq + 1) & 0xFFFF;

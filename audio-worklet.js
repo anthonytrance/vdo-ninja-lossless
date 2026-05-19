@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC AudioWorklet v1.0.25.
+ * VDO.Ninja Lossless DC AudioWorklet v1.0.26.
  *
  * GENERATED FILE — do not edit by hand. Regenerate via:
  *   npm run build:worklet
@@ -23,6 +23,7 @@
  *   v1.0.21: re-arm trims stale queued audio + drift gating after re-arm.
  *   v1.0.24: fixed-ratio linear resampler replaces steady-state splices.
  *   v1.0.25: bounded rate estimator, arm cushion, and partial-shortfall clamp.
+ *   v1.0.26: freeze at trusted ratio, disable fill-driven ppm nudging, confirm learning.
  */
 
 'use strict';
@@ -84,16 +85,22 @@ const DRIFT_FILL_ALPHA = 0.0025;
 
 // Fixed-ratio resampler drift correction. Ratio > 1 consumes input faster,
 // ratio < 1 stretches input. The counter window estimates sender/receiver
-// clock ratio. A tiny smoothed fill term only recenters the buffer over time.
+// clock ratio. Buffer-fill error is diagnostic only; it must not modulate pitch.
 const RESAMPLER_WINDOW_SEC = 30.0;
 const RESAMPLER_FIRST_WINDOW_SEC = 30.0;
 const RESAMPLER_RATIO_SMOOTHING_NEW = 0.15;
 const RESAMPLER_RATIO_MIN = 0.995;       // +/-5000 ppm sanity reject.
 const RESAMPLER_RATIO_MAX = 1.005;
-const RESAMPLER_MEASURED_MAX_PPM = 250;  // Reject packet-phase false positives.
+const RESAMPLER_MEASURED_MAX_PPM = 500;  // Reject non-clock outliers, not real device drift.
+const RESAMPLER_MEASURED_DEADBAND_PPM = 75;
+const RESAMPLER_LEARN_CONFIRM_WINDOWS = 2;
+const RESAMPLER_LEARN_AGREE_PPM = 75;
 const RESAMPLER_FILL_CORRECTION_SEC = 30.0;
-const RESAMPLER_FILL_MAX_PPM = 500;
+const RESAMPLER_FILL_MAX_PPM = 0;        // Do not let buffer fill modulate pitch.
 const RESAMPLER_RATIO_SLEW = 0.0025;     // About 1 s time constant at 48k/128.
+const RESAMPLER_STABLE_HOLD_SEC = 15.0;
+const LATENCY_TRIM_ARM_SEC = 2.0;
+const LATENCY_TRIM_STABLE_SEC = 0.5;
 
 function clampTarget(n) {
   if (!Number.isFinite(n)) return DEFAULT_TARGET_FRAMES;
@@ -137,6 +144,8 @@ class PlayoutChain {
     this._clickTrimFrames = 0;
     this._clickTrimFires = 0;
     this._pendingClickTrimXfade = false;
+    this._renderFramesSinceArm = 0;
+    this._renderFramesSinceDisturbance = 0;
 
     // Drift / resampler state. The old skip/repeat counters stay exposed so
     // existing overlay and harness parsing remains stable; the Phase-4 path
@@ -164,9 +173,14 @@ class PlayoutChain {
     this._resamplerUpdates = 0;
     this._measuredRateRatio = 1.0;
     this._baseRateRatio = 1.0;
+    this._trustedRateRatio = 1.0;
+    this._pendingRateRatio = 1.0;
+    this._pendingRateConfirmations = 0;
     this._targetRateRatio = 1.0;
     this._appliedRateRatio = 1.0;
     this._lastFillCorrectionPpm = 0;
+    this._stableRenderFrames = 0;
+    this._resamplerFillArmed = false;
   }
 
   enqueue(samples, srcChannels) {
@@ -229,29 +243,54 @@ class PlayoutChain {
       clickTrimFrames: this._clickTrimFrames,
       clickTrimFires: this._clickTrimFires,
       clickTrimThreshold: this.currentTargetFrames + this._effectiveClickTrimMargin(),
+      clickTrimLatencyThreshold: this._latencyTrimThresholdFrames(),
+      clickTrimStableSec: this._renderFramesSinceDisturbance / this.sampleRate,
       lastPacketFrames: this._lastPacketFrames,
       resamplerRatio: this._appliedRateRatio,
       resamplerBaseRatio: this._baseRateRatio,
+      resamplerTrustedRatio: this._trustedRateRatio,
+      resamplerPendingRatio: this._pendingRateRatio,
+      resamplerPendingConfirmations: this._pendingRateConfirmations,
       resamplerTargetRatio: this._targetRateRatio,
       resamplerMeasuredRatio: this._measuredRateRatio,
       resamplerUpdates: this._resamplerUpdates,
       resamplerActive: this._resamplerActivelyTracking,
+      resamplerFillArmed: this._resamplerFillArmed,
       resamplerFillCorrectionPpm: this._lastFillCorrectionPpm,
       resamplerFrac: this._resampleFrac,
+      resamplerStableSec: this._stableRenderFrames / this.sampleRate,
     };
   }
 
   _effectiveClickTrimMargin() {
     if (this._clickTrimMarginFrames != null) return this._clickTrimMarginFrames;
-    // Default margin: max(packetFrames, currentTargetFrames). Matches RemSound's
-    // floorMargin + knob-extra pattern: packet-size floor so the natural
-    // arrival sawtooth doesn't false-trim, plus a target-sized headroom so the
-    // drift integrator has room to drain small overhead before the snap fires.
-    return Math.max(this._lastPacketFrames, this.currentTargetFrames);
+    // Default margin follows RemSound's normal smoothness shape: packet-size
+    // floor, a small fixed floor for tiny packets, plus extra headroom. A trim
+    // is a splice, so it should be a safety net for real backlog, not something
+    // that fights ordinary startup bursts at 20 ms.
+    const packetFloor = Math.round(this._lastPacketFrames * 4) + Math.round(this.sampleRate * 0.004);
+    const fixedFloor = Math.round(this.sampleRate * 0.015);
+    const knobExtra = Math.round(this.sampleRate * 0.008);
+    return Math.max(packetFloor, fixedFloor) + knobExtra;
   }
 
   _markRateDisturbed() {
+    const trusted = this._trustedRateRatio;
     this._rateWindowDisturbed = true;
+    this._stableRenderFrames = 0;
+    this._renderFramesSinceDisturbance = 0;
+    this._resamplerActivelyTracking = trusted !== 1.0;
+    this._measuredRateRatio = trusted;
+    this._baseRateRatio = trusted;
+    this._targetRateRatio = trusted;
+    this._appliedRateRatio = trusted;
+    this._pendingRateRatio = trusted;
+    this._pendingRateConfirmations = 0;
+    this._lastFillCorrectionPpm = 0;
+    this._resamplerFillArmed = false;
+    this._filledLpInit = false;
+    this._rateWindowStartOutput = this._framesOutputForRate;
+    this._rateWindowStartWritten = this._framesWrittenForRate;
   }
 
   _lowLatencyCushionFrames() {
@@ -265,23 +304,129 @@ class PlayoutChain {
     return Math.min(this._ringSize, this.currentTargetFrames + this._lowLatencyCushionFrames());
   }
 
+  _clickTrimKeepFrames() {
+    const keepCushion = Math.max(
+      this._lowLatencyCushionFrames(),
+      Math.round(this._lastPacketFrames * 2) + Math.round(this.sampleRate * 0.005)
+    );
+    return Math.min(this._ringSize, this.currentTargetFrames + keepCushion);
+  }
+
+  _latencyTrimThresholdFrames() {
+    const packetRecovery = Math.round(this._lastPacketFrames * 2) + Math.round(this.sampleRate * 0.002);
+    const fixedRecovery = Math.round(this.sampleRate * 0.010);
+    return Math.min(this._ringSize, this.currentTargetFrames + Math.max(packetRecovery, fixedRecovery));
+  }
+
+  _latencyTrimReady() {
+    return this._renderFramesSinceArm >= this.sampleRate * LATENCY_TRIM_ARM_SEC &&
+      this._renderFramesSinceDisturbance >= this.sampleRate * LATENCY_TRIM_STABLE_SEC;
+  }
+
   _resetRateEstimator() {
+    const trusted = this._trustedRateRatio;
     this._resampleFrac = 0;
     this._rateWindowStartOutput = this._framesOutputForRate;
     this._rateWindowStartWritten = this._framesWrittenForRate;
     this._rateWindowActive = true;
     this._rateWindowDisturbed = false;
-    this._resamplerActivelyTracking = false;
+    this._resamplerActivelyTracking = trusted !== 1.0;
     this._resamplerUpdates = 0;
-    this._measuredRateRatio = 1.0;
-    this._baseRateRatio = 1.0;
-    this._targetRateRatio = 1.0;
-    this._appliedRateRatio = 1.0;
+    this._measuredRateRatio = trusted;
+    this._baseRateRatio = trusted;
+    this._targetRateRatio = trusted;
+    this._appliedRateRatio = trusted;
+    this._pendingRateRatio = trusted;
+    this._pendingRateConfirmations = 0;
     this._lastFillCorrectionPpm = 0;
+    this._stableRenderFrames = 0;
+    this._resamplerFillArmed = false;
+  }
+
+  _clearPendingRate() {
+    this._pendingRateRatio = this._trustedRateRatio;
+    this._pendingRateConfirmations = 0;
+  }
+
+  _acceptMeasuredRate(measured) {
+    const measuredPpm = Math.abs((measured - 1.0) * 1e6);
+    if (measured < RESAMPLER_RATIO_MIN || measured > RESAMPLER_RATIO_MAX
+        || measuredPpm > RESAMPLER_MEASURED_MAX_PPM) {
+      this._clearPendingRate();
+      return false;
+    }
+
+    const trusted = this._trustedRateRatio;
+    if (measuredPpm < RESAMPLER_MEASURED_DEADBAND_PPM) {
+      this._measuredRateRatio = trusted;
+      this._clearPendingRate();
+      return false;
+    }
+
+    const deltaPpm = (measured - trusted) * 1e6;
+    if (Math.abs(deltaPpm) < RESAMPLER_MEASURED_DEADBAND_PPM) {
+      this._measuredRateRatio = trusted;
+      this._clearPendingRate();
+      return false;
+    }
+
+    if (this._pendingRateConfirmations > 0) {
+      const pendingDeltaPpm = (this._pendingRateRatio - trusted) * 1e6;
+      const agree = Math.sign(deltaPpm) === Math.sign(pendingDeltaPpm)
+        && Math.abs((measured - this._pendingRateRatio) * 1e6) <= RESAMPLER_LEARN_AGREE_PPM;
+      if (agree) {
+        this._pendingRateRatio = (this._pendingRateRatio * this._pendingRateConfirmations + measured)
+          / (this._pendingRateConfirmations + 1);
+        this._pendingRateConfirmations++;
+      } else {
+        this._pendingRateRatio = measured;
+        this._pendingRateConfirmations = 1;
+      }
+    } else {
+      this._pendingRateRatio = measured;
+      this._pendingRateConfirmations = 1;
+    }
+
+    if (this._pendingRateConfirmations < RESAMPLER_LEARN_CONFIRM_WINDOWS) {
+      this._measuredRateRatio = this._pendingRateRatio;
+      return false;
+    }
+
+    this._measuredRateRatio = this._pendingRateRatio;
+    if (!this._resamplerActivelyTracking) {
+      this._baseRateRatio = this._measuredRateRatio;
+      this._resamplerActivelyTracking = true;
+    } else {
+      this._baseRateRatio = (1.0 - RESAMPLER_RATIO_SMOOTHING_NEW) * this._baseRateRatio
+        + RESAMPLER_RATIO_SMOOTHING_NEW * this._measuredRateRatio;
+    }
+    this._trustedRateRatio = this._baseRateRatio;
+    this._resamplerFillArmed = true;
+    this._resamplerUpdates++;
+    this._clearPendingRate();
+    return true;
   }
 
   _updateResamplerRate(quantum) {
     if (!this._rateWindowActive) this._resetRateEstimator();
+
+    if (this._stableRenderFrames < this.sampleRate * RESAMPLER_STABLE_HOLD_SEC) {
+      const trusted = this._trustedRateRatio;
+      this._filledLp = this._filled;
+      this._filledLpInit = true;
+      this._measuredRateRatio = trusted;
+      this._baseRateRatio = trusted;
+      this._targetRateRatio = trusted;
+      this._appliedRateRatio = trusted;
+      this._pendingRateRatio = trusted;
+      this._pendingRateConfirmations = 0;
+      this._lastFillCorrectionPpm = 0;
+      this._resamplerFillArmed = false;
+      this._rateWindowStartOutput = this._framesOutputForRate;
+      this._rateWindowStartWritten = this._framesWrittenForRate;
+      this._rateWindowDisturbed = false;
+      return;
+    }
 
     const outputDelta = this._framesOutputForRate - this._rateWindowStartOutput;
     const windowSec = this._resamplerActivelyTracking ? RESAMPLER_WINDOW_SEC : RESAMPLER_FIRST_WINDOW_SEC;
@@ -289,18 +434,7 @@ class PlayoutChain {
       const writtenDelta = this._framesWrittenForRate - this._rateWindowStartWritten;
       if (!this._rateWindowDisturbed && outputDelta > 0 && writtenDelta > 0) {
         const measured = writtenDelta / outputDelta;
-        const measuredPpm = Math.abs((measured - 1.0) * 1e6);
-        if (measured >= RESAMPLER_RATIO_MIN && measured <= RESAMPLER_RATIO_MAX
-            && measuredPpm <= RESAMPLER_MEASURED_MAX_PPM) {
-          this._measuredRateRatio = measured;
-          if (!this._resamplerActivelyTracking) {
-            this._baseRateRatio = measured;
-            this._resamplerActivelyTracking = true;
-          } else {
-            this._baseRateRatio = (1.0 - RESAMPLER_RATIO_SMOOTHING_NEW) * this._baseRateRatio
-              + RESAMPLER_RATIO_SMOOTHING_NEW * measured;
-          }
-          this._resamplerUpdates++;
+        if (this._acceptMeasuredRate(measured)) {
           this._emit({
             type: 'resampler',
             ratio: this._appliedRateRatio,
@@ -332,9 +466,12 @@ class PlayoutChain {
     else if (error < -deadband) controlled = error + deadband;
 
     const maxCorrection = RESAMPLER_FILL_MAX_PPM / 1e6;
-    let fillCorrection = controlled / (this.sampleRate * RESAMPLER_FILL_CORRECTION_SEC);
-    if (fillCorrection > maxCorrection) fillCorrection = maxCorrection;
-    else if (fillCorrection < -maxCorrection) fillCorrection = -maxCorrection;
+    let fillCorrection = 0;
+    if (this._resamplerFillArmed && maxCorrection > 0) {
+      fillCorrection = controlled / (this.sampleRate * RESAMPLER_FILL_CORRECTION_SEC);
+      if (fillCorrection > maxCorrection) fillCorrection = maxCorrection;
+      else if (fillCorrection < -maxCorrection) fillCorrection = -maxCorrection;
+    }
     this._lastFillCorrectionPpm = fillCorrection * 1e6;
 
     this._targetRateRatio = this._baseRateRatio + fillCorrection;
@@ -354,17 +491,18 @@ class PlayoutChain {
   }
 
   _applyClickTrimIfNeeded() {
-    const margin = this._effectiveClickTrimMargin();
-    const threshold = this.currentTargetFrames + margin;
-    if (this._filled <= threshold) return false;
-    // Snap _readPos forward, but leave a packet-half cushion above target so
-    // the post-trim sawtooth oscillates AROUND target instead of dropping
-    // below it. Without the cushion, trim cuts the burst peaks down to
-    // target, the drain phase between bursts pulls fill below target, and
-    // the drift integrator sees a persistent deficit and fires repeats —
-    // an oscillation that defeats the whole point of the trim.
-    const cushion = Math.max(0, Math.round(this._lastPacketFrames / 2));
-    const keep = this.currentTargetFrames + cushion;
+    const safetyThreshold = this.currentTargetFrames + this._effectiveClickTrimMargin();
+    const latencyThreshold = this._latencyTrimThresholdFrames();
+    const latencyTrim = this._filled > latencyThreshold && this._latencyTrimReady();
+    const safetyTrim = this._filled > safetyThreshold;
+    if (!latencyTrim && !safetyTrim) return false;
+    // Safety trims are a loose backlog guard. Latency trims are tighter, but
+    // only after stable rendering, so startup bursts and recent underruns do
+    // not immediately get cut back to the edge.
+    const threshold = safetyTrim ? safetyThreshold : latencyThreshold;
+    let keep = safetyTrim ? this._clickTrimKeepFrames() : this._servoTargetFrames();
+    if (keep >= this._filled) keep = this._servoTargetFrames();
+    if (this._filled <= keep) return false;
     const dropped = this._filled - keep;
     this._readPos = (this._writePos - keep + this._ringSize) % this._ringSize;
     this._filled = keep;
@@ -378,12 +516,15 @@ class PlayoutChain {
     // view of "error" is now zero and any accumulator from before is stale.
     this._driftAcc = 0;
     this._filledLpInit = false;
-    this._driftHoldTicks = DRIFT_REARM_HOLD_TICKS;
-    this._driftEventCooldownTicks = DRIFT_MIN_EVENT_TICKS;
     this._resampleFrac = 0;
-    this._markRateDisturbed();
+    if (safetyTrim) {
+      this._driftHoldTicks = DRIFT_REARM_HOLD_TICKS;
+      this._driftEventCooldownTicks = DRIFT_MIN_EVENT_TICKS;
+      this._markRateDisturbed();
+    }
     this._emit({
       type: 'click-trim',
+      mode: safetyTrim ? 'safety' : 'latency',
       dropped,
       totalDropped: this._clickTrimFrames,
       fires: this._clickTrimFires,
@@ -427,6 +568,8 @@ class PlayoutChain {
     if (armed) this._trimStaleFramesForArm();
     this._armed = armed;
     this._consecutiveUnderruns = 0;
+    this._renderFramesSinceArm = 0;
+    this._renderFramesSinceDisturbance = 0;
     this._inConcealment = false;
     this._fadeInOnNextRead = !!armed;
     for (let c = 0; c < this._channels; c++) this._lastOutSample[c] = 0;
@@ -581,6 +724,11 @@ class PlayoutChain {
     }
 
     this._consecutiveUnderruns = 0;
+    this._renderFramesSinceArm += quantum;
+    if (!inputLimited) {
+      this._stableRenderFrames += quantum;
+      this._renderFramesSinceDisturbance += quantum;
+    }
     this._postBufferStatus();
   }
 }
@@ -614,9 +762,15 @@ if (typeof module !== 'undefined' && module.exports) {
     RESAMPLER_RATIO_MIN,
     RESAMPLER_RATIO_MAX,
     RESAMPLER_MEASURED_MAX_PPM,
+    RESAMPLER_MEASURED_DEADBAND_PPM,
+    RESAMPLER_LEARN_CONFIRM_WINDOWS,
+    RESAMPLER_LEARN_AGREE_PPM,
     RESAMPLER_FILL_CORRECTION_SEC,
     RESAMPLER_FILL_MAX_PPM,
     RESAMPLER_RATIO_SLEW,
+    RESAMPLER_STABLE_HOLD_SEC,
+    LATENCY_TRIM_ARM_SEC,
+    LATENCY_TRIM_STABLE_SEC,
     CLICK_TRIM_FADE_FRAMES,
   };
 }

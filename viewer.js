@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC Viewer v1.0.25
+ * VDO.Ninja Lossless DC Viewer v1.0.26
  *
  * Inject via:  &js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
  *
@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.25';
+  const VERSION     = '1.0.26';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
@@ -40,11 +40,15 @@
   // Default 30 ms — Layer A of the four-layer playout model.
   const TARGET_BUFFER_MS = _numberParam(['dcBuffer', 'losslessBufferMs'], _profile.dcBuffer || 30, 5, 300);
   const TARGET_BUFFER_FRAMES = Math.round(48000 * TARGET_BUFFER_MS / 1000);
-  const STARTUP_PREROLL_PACKETS = Math.round(_numberParam(['losslessPreroll'], 2, 1, 10));
   // Receiver-requested wire packet size + format, sent in the ack so the
   // publisher chunks per peer. Per-peer-independent: two listeners can ask
   // for different sizes and the publisher tailors its DC output to each.
   const REQUESTED_FRAME_MS = _numberParam(['dcFrame'], _profile.dcFrame || 10, 1, 100);
+  const REQUESTED_FRAME_FRAMES = Math.max(1, Math.round(48000 * REQUESTED_FRAME_MS / 1000));
+  const DEFAULT_STARTUP_PREROLL_PACKETS = Math.max(2, Math.min(10,
+    Math.ceil((TARGET_BUFFER_FRAMES + Math.min(REQUESTED_FRAME_FRAMES, Math.round(TARGET_BUFFER_FRAMES / 4))) / REQUESTED_FRAME_FRAMES)
+  ));
+  const STARTUP_PREROLL_PACKETS = Math.round(_numberParam(['losslessPreroll'], DEFAULT_STARTUP_PREROLL_PACKETS, 1, 10));
   const REQUESTED_FORMAT = (() => {
     const fmt = (_stringParam(['dcFormat']) || _profile.dcFormat || 'int16').toLowerCase();
     return (fmt === 'float32' || fmt === 'int16') ? fmt : 'int16';

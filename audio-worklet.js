@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC AudioWorklet v1.0.28.
+ * VDO.Ninja Lossless DC AudioWorklet v1.0.29.
  *
  * GENERATED FILE — do not edit by hand. Regenerate via:
  *   npm run build:worklet
@@ -26,6 +26,7 @@
  *   v1.0.26: freeze at trusted ratio, disable fill-driven ppm nudging, confirm learning.
  *   v1.0.27: keep long-term clock learning alive through playout disturbances.
  *   v1.0.28: expose drift learner measured/pending ratios for diagnostics.
+ *   v1.0.29: make latency trim conservative after low-latency underruns.
  */
 
 'use strict';
@@ -103,7 +104,7 @@ const RESAMPLER_FILL_MAX_PPM = 0;        // Do not let buffer fill modulate pitc
 const RESAMPLER_RATIO_SLEW = 0.0025;     // About 1 s time constant at 48k/128.
 const RESAMPLER_STABLE_HOLD_SEC = 5.0;
 const LATENCY_TRIM_ARM_SEC = 2.0;
-const LATENCY_TRIM_STABLE_SEC = 0.5;
+const LATENCY_TRIM_STABLE_SEC = 3.0;
 
 function clampTarget(n) {
   if (!Number.isFinite(n)) return DEFAULT_TARGET_FRAMES;
@@ -303,6 +304,14 @@ class PlayoutChain {
     const keepCushion = Math.max(
       this._lowLatencyCushionFrames(),
       Math.round(this._lastPacketFrames * 2) + Math.round(this.sampleRate * 0.005)
+    );
+    return Math.min(this._ringSize, this.currentTargetFrames + keepCushion);
+  }
+
+  _latencyTrimKeepFrames() {
+    const keepCushion = Math.max(
+      this._lowLatencyCushionFrames(),
+      this._lastPacketFrames + Math.round(this.sampleRate * 0.002)
     );
     return Math.min(this._ringSize, this.currentTargetFrames + keepCushion);
   }
@@ -530,7 +539,7 @@ class PlayoutChain {
     // only after stable rendering, so startup bursts and recent underruns do
     // not immediately get cut back to the edge.
     const threshold = safetyTrim ? safetyThreshold : latencyThreshold;
-    let keep = safetyTrim ? this._clickTrimKeepFrames() : this._servoTargetFrames();
+    let keep = safetyTrim ? this._clickTrimKeepFrames() : this._latencyTrimKeepFrames();
     if (keep >= this._filled) keep = this._servoTargetFrames();
     if (this._filled <= keep) return false;
     const dropped = this._filled - keep;

@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC Viewer v1.0.28
+ * VDO.Ninja Lossless DC Viewer v1.0.29
  *
  * Inject via:  &js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
  *
@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.28';
+  const VERSION     = '1.0.29';
   const DEBUG_ON    = (() => {
     try {
       const v = (new URLSearchParams(window.location.search)).get('debug');

@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC Viewer v1.0.23
+ * VDO.Ninja Lossless DC Viewer v1.0.25
  *
  * Inject via:  &js=https://anthonytrance.github.io/vdo-ninja-lossless/viewer.js
  *
@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.23';
+  const VERSION     = '1.0.25';
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
   const DC_PROTOCOL = 'vdo-ninja-hifi-1';
@@ -115,6 +115,17 @@
   // Worklet URL resolution
   // -------------------------------------------------------------------------
   function _getWorkletUrl() {
+    if (typeof window !== 'undefined' && typeof window.__LOSSLESS_WORKLET_SOURCE === 'string') {
+      try {
+        if (!window.__LOSSLESS_WORKLET_BLOB_URL) {
+          window.__LOSSLESS_WORKLET_BLOB_URL = URL.createObjectURL(new Blob(
+            [window.__LOSSLESS_WORKLET_SOURCE],
+            { type: 'application/javascript' }
+          ));
+        }
+        return window.__LOSSLESS_WORKLET_BLOB_URL;
+      } catch (_) {}
+    }
     const workletFile = `audio-worklet.js?v=${encodeURIComponent(VERSION)}`;
     try {
       const params = new URLSearchParams(window.location.search);
@@ -142,6 +153,7 @@
              frames: 0, seqDrops: 0, audioUnderruns: 0, concealed: 0,
              driftSkips: 0, driftRepeats: 0, rearmTrimFrames: 0, clickTrimFrames: 0,
              bytes: 0, opusRestored: false, bufferFrames: 0,
+             resamplerRatio: 1.0, resamplerUpdates: 0,
              lastGoodFrame: null,
              armed: false, losslessStarted: false, startupQueue: [],
              pollTimer: null };
@@ -217,11 +229,21 @@
       }
       if (m.type === 'buffer') {
         peer.bufferFrames = m.filled || 0;
+        if (typeof m.ratio === 'number') peer.resamplerRatio = m.ratio;
+        if (typeof m.updates === 'number') peer.resamplerUpdates = m.updates;
+        _updateOverlay();
+      }
+      if (m.type === 'resampler') {
+        if (typeof m.ratio === 'number') peer.resamplerRatio = m.ratio;
+        if (typeof m.updates === 'number') peer.resamplerUpdates = m.updates;
+        if (typeof m.filled === 'number') peer.bufferFrames = m.filled;
         _updateOverlay();
       }
       if (m.type === 'drift') {
-        peer.driftSkips   = m.skips   || 0;
-        peer.driftRepeats = m.repeats || 0;
+        if (!peer.legacyDriftWarned) {
+          peer.legacyDriftWarned = true;
+          warn('Ignoring legacy drift splice event from worklet');
+        }
         if (typeof m.filled === 'number') peer.bufferFrames = m.filled;
         _updateOverlay();
       }
@@ -499,6 +521,45 @@
     return _origCreateAnswer.apply(this, args);
   };
 
+  // Test-harness debug hook (gated on &debug=1). Exposes _peers and version so
+  // the autonomous browser harness can read per-peer state without parsing the
+  // overlay text. Non-breaking — production loads don't set this.
+  try {
+    const _debugOn = (new URLSearchParams(window.location.search)).get('debug');
+    if (_debugOn === '1' || _debugOn === 'true') {
+      window.__LosslessDcDebug = Object.freeze({
+        get peers() { return _peers; },
+        get version() { return VERSION; },
+        get targetBufferMs() { return TARGET_BUFFER_MS; },
+        get requestedFrameMs() { return REQUESTED_FRAME_MS; },
+        get requestedFormat() { return REQUESTED_FORMAT; },
+        get dcMode() { return _dcMode || null; },
+        snapshot() {
+          const peers = [];
+          for (const [, p] of _peers) {
+            peers.push({
+              hasHandshake: !!p.handshake,
+              armed: !!p.armed,
+              losslessStarted: !!p.losslessStarted,
+              opusRestored: !!p.opusRestored,
+              frames: p.frames, bytes: p.bytes,
+              seqDrops: p.seqDrops, audioUnderruns: p.audioUnderruns,
+              concealed: p.concealed,
+              driftSkips: p.driftSkips, driftRepeats: p.driftRepeats,
+              rearmTrimFrames: p.rearmTrimFrames, clickTrimFrames: p.clickTrimFrames,
+              bufferFrames: p.bufferFrames, targetFrames: p.targetFrames || 0,
+              resamplerRatio: p.resamplerRatio || 1.0,
+              resamplerUpdates: p.resamplerUpdates || 0,
+              lastFrameMs: p.lastFrameMs, lastSeq: p.lastSeq,
+            });
+          }
+          return { version: VERSION, peers };
+        },
+      });
+      log('debug hook installed at window.__LosslessDcDebug');
+    }
+  } catch (_) {}
+
   log('RTCPeerConnection prototype patched — lossless DC ready');
   log(`Latency profile: ${_dcMode ? `dcMode=${_dcMode} → ` : ''}` +
     `dcBuffer=${TARGET_BUFFER_MS}ms (target=${TARGET_BUFFER_FRAMES} frames) ` +
@@ -550,11 +611,13 @@
     _overlay.appendChild(title);
 
     _stateNode = document.createElement('div');
+    _stateNode.setAttribute('data-lossless-state', '');
     _stateNode.textContent = 'IDLE';
     _overlay.appendChild(_stateNode);
 
     _statsNode = document.createElement('div');
-    _statsNode.textContent = 'Frames: 0  SeqDrops: 0  AudioUnderruns: 0 (0/min)  Drift: 0/0 (0/min)  RearmTrim: 0ms (0/min)  ClickTrim: 0ms (0/min)  Buffer: 0/0 armed 0ms / target 0ms  ~0 kbps';
+    _statsNode.setAttribute('data-lossless-stats', '');
+    _statsNode.textContent = 'Frames: 0  SeqDrops: 0  AudioUnderruns: 0 (0/min)  Drift: 0/0 (0/min)  RearmTrim: 0ms (0/min)  ClickTrim: 0ms (0/min)  Buffer: 0/0 armed 0ms / target 0ms  Ratio: 0ppm  ~0 kbps';
     _overlay.appendChild(_statsNode);
 
     const btnRow = document.createElement('div');
@@ -622,6 +685,7 @@
     let totalFrames = 0, totalSeqDrops = 0, totalAudioUnderruns = 0, totalConcealed = 0;
     let totalDriftSkips = 0, totalDriftRepeats = 0, totalRearmTrimFrames = 0, totalClickTrimFrames = 0;
     let totalBytes = 0, armedCount = 0, losslessPeers = 0, minBufferFrames = null, maxTargetFrames = 0;
+    let ratioSum = 0, ratioCount = 0, ratioUpdates = 0;
     for (const [, p] of _peers) {
       if (!p.handshake) continue;
       totalFrames    += p.frames;
@@ -637,6 +701,11 @@
       if (p.armed) armedCount++;
       if (p.bufferFrames > 0) minBufferFrames = minBufferFrames === null ? p.bufferFrames : Math.min(minBufferFrames, p.bufferFrames);
       if (typeof p.targetFrames === 'number' && p.targetFrames > maxTargetFrames) maxTargetFrames = p.targetFrames;
+      if (typeof p.resamplerRatio === 'number' && p.resamplerRatio > 0) {
+        ratioSum += p.resamplerRatio;
+        ratioCount++;
+      }
+      ratioUpdates += p.resamplerUpdates || 0;
     }
     const elapsed  = totalFrames * (REQUESTED_FRAME_MS / 1000);
     const kbps     = elapsed > 0 ? Math.round((totalBytes * 8) / elapsed / 1000) : 0;
@@ -648,6 +717,7 @@
     const rearmTrimMs = Math.round(totalRearmTrimFrames / 48);
     const clickTrimMs = Math.round(totalClickTrimFrames / 48);
     const totalDriftEvents = totalDriftSkips + totalDriftRepeats;
+    const ratioPpm = ratioCount > 0 ? Math.round(((ratioSum / ratioCount) - 1.0) * 1000000) : 0;
     const now = Date.now();
     _sampleRate(now, totalAudioUnderruns, totalDriftEvents, totalRearmTrimFrames, totalClickTrimFrames);
     const auPerMin = _ratePerMin(now, totalAudioUnderruns, 'au');
@@ -656,7 +726,7 @@
     const ctPerMinFrames = _ratePerMin(now, totalClickTrimFrames, 'ct');
     const rtPerMinMs = Math.round(rtPerMinFrames / 48);
     const ctPerMinMs = Math.round(ctPerMinFrames / 48);
-    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  SeqDrops: ${totalSeqDrops}  AudioUnderruns: ${totalAudioUnderruns} (${auPerMin}/min)  Drift: ${totalDriftSkips}/${totalDriftRepeats} (${dfPerMin}/min)  RearmTrim: ${rearmTrimMs}ms (${rtPerMinMs}ms/min)  ClickTrim: ${clickTrimMs}ms (${ctPerMinMs}ms/min)  Buffer: ${armedCount}/${losslessPeers} armed ${bufMs}ms / target ${targetMs}ms  ~${kbps} kbps`;
+    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  SeqDrops: ${totalSeqDrops}  AudioUnderruns: ${totalAudioUnderruns} (${auPerMin}/min)  Drift: ${totalDriftSkips}/${totalDriftRepeats} (${dfPerMin}/min)  RearmTrim: ${rearmTrimMs}ms (${rtPerMinMs}ms/min)  ClickTrim: ${clickTrimMs}ms (${ctPerMinMs}ms/min)  Buffer: ${armedCount}/${losslessPeers} armed ${bufMs}ms / target ${targetMs}ms  Ratio: ${ratioPpm}ppm/${ratioUpdates}u  ~${kbps} kbps`;
 
     // Conditional visibility — Disable when lossless is playing, Retry when Opus is.
     if (_disableBtn) {
@@ -704,6 +774,8 @@
       peer.rearmTrimFrames = 0;
       peer.bytes = 0;
       peer.bufferFrames = 0;
+      peer.resamplerRatio = 1.0;
+      peer.resamplerUpdates = 0;
       peer.lastFrameMs = 0;
       peer.lastSeq = -1;
       peer.armed = false;
@@ -726,7 +798,8 @@
     for (const [, p] of _peers) {
       if (!p.handshake || p.frames === 0) continue;
       const age = now - p.lastFrameMs;
-      log(`stats: frames=${p.frames} seqDrops=${p.seqDrops} audioUnderruns=${p.audioUnderruns} concealed=${p.concealed} buffer=${p.bufferFrames}f ~${Math.round((p.bytes * 8) / (p.frames * REQUESTED_FRAME_MS / 1000) / 1000)}kbps state=${age < FALLBACK_MS ? 'active' : 'silent'} lastFrame=${age}ms ago`);
+      const ratioPpm = Math.round(((p.resamplerRatio || 1.0) - 1.0) * 1000000);
+      log(`stats: frames=${p.frames} seqDrops=${p.seqDrops} audioUnderruns=${p.audioUnderruns} concealed=${p.concealed} buffer=${p.bufferFrames}f ratio=${ratioPpm}ppm ~${Math.round((p.bytes * 8) / (p.frames * REQUESTED_FRAME_MS / 1000) / 1000)}kbps state=${age < FALLBACK_MS ? 'active' : 'silent'} lastFrame=${age}ms ago`);
     }
     _updateOverlay();
   }, 1000);

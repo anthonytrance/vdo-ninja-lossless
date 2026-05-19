@@ -1,5 +1,5 @@
 /**
- * VDO.Ninja Lossless DC AudioWorklet v1.0.22.
+ * VDO.Ninja Lossless DC AudioWorklet v1.0.25.
  *
  * GENERATED FILE — do not edit by hand. Regenerate via:
  *   npm run build:worklet
@@ -21,6 +21,8 @@
  *   v1.0.19 — REVERTED. filledLp = target on re-arm exploded skip rate.
  *   v1.0.20: filledLp re-initialised to current _filled on (re-)arm.
  *   v1.0.21: re-arm trims stale queued audio + drift gating after re-arm.
+ *   v1.0.24: fixed-ratio linear resampler replaces steady-state splices.
+ *   v1.0.25: bounded rate estimator, arm cushion, and partial-shortfall clamp.
  */
 
 'use strict';
@@ -65,7 +67,9 @@ const BUFFER_STATUS_TICKS = 50;
 const CONCEAL_FADE_FRAMES = 32;      // ~0.67 ms @ 48 kHz — RemSound ConcealFadeFramesShort.
 const CLICK_TRIM_FADE_FRAMES = 32;   // Crossfade span for the click-trim splice (same shape).
 
-// Drift integrator constants (RemSound SessionPlayout.cs, 2026-05-06).
+// Legacy discrete drift integrator constants. The Phase-4 path below keeps
+// these exports and counters for compatibility, but steady-state correction is
+// handled by the fixed-ratio linear resampler instead of skip/repeat splices.
 const DRIFT_GAIN_BASE = 0.005;
 const DRIFT_SMALL_ERROR_FRAMES = 50;
 const DRIFT_MAX_GAIN_SCALE = 20;
@@ -77,6 +81,19 @@ const DRIFT_MIN_EVENT_TICKS = 32;     // Spread corrections; no skip/repeat burs
 // and dt = 128/48000, tau ≈ 1.07 s — long enough to bury the 10 ms WebRTC
 // burst sawtooth, fast enough to track drift on a few-second timescale.
 const DRIFT_FILL_ALPHA = 0.0025;
+
+// Fixed-ratio resampler drift correction. Ratio > 1 consumes input faster,
+// ratio < 1 stretches input. The counter window estimates sender/receiver
+// clock ratio. A tiny smoothed fill term only recenters the buffer over time.
+const RESAMPLER_WINDOW_SEC = 30.0;
+const RESAMPLER_FIRST_WINDOW_SEC = 30.0;
+const RESAMPLER_RATIO_SMOOTHING_NEW = 0.15;
+const RESAMPLER_RATIO_MIN = 0.995;       // +/-5000 ppm sanity reject.
+const RESAMPLER_RATIO_MAX = 1.005;
+const RESAMPLER_MEASURED_MAX_PPM = 250;  // Reject packet-phase false positives.
+const RESAMPLER_FILL_CORRECTION_SEC = 30.0;
+const RESAMPLER_FILL_MAX_PPM = 500;
+const RESAMPLER_RATIO_SLEW = 0.0025;     // About 1 s time constant at 48k/128.
 
 function clampTarget(n) {
   if (!Number.isFinite(n)) return DEFAULT_TARGET_FRAMES;
@@ -99,6 +116,7 @@ class PlayoutChain {
     this._filled   = 0;
     this._armed = false;
     this._consecutiveUnderruns = 0;
+    this._partialUnderruns = 0;
     this._statusTicks = 0;
 
     this._lastOutSample = new Float32Array(this._channels);
@@ -120,7 +138,9 @@ class PlayoutChain {
     this._clickTrimFires = 0;
     this._pendingClickTrimXfade = false;
 
-    // Drift integrator state. Resets on every (re-)arm.
+    // Drift / resampler state. The old skip/repeat counters stay exposed so
+    // existing overlay and harness parsing remains stable; the Phase-4 path
+    // should leave them at zero in steady state.
     this._driftAcc = 0;
     this._filledLp = 0;
     this._filledLpInit = false;
@@ -132,6 +152,21 @@ class PlayoutChain {
     for (let k = 0; k < DRIFT_XFADE_FRAMES; k++) {
       this._driftXfade[k] = 0.5 * (1 - Math.cos(Math.PI * (k + 1) / DRIFT_XFADE_FRAMES));
     }
+
+    this._resampleFrac = 0;
+    this._framesWrittenForRate = 0;
+    this._framesOutputForRate = 0;
+    this._rateWindowStartOutput = 0;
+    this._rateWindowStartWritten = 0;
+    this._rateWindowActive = false;
+    this._rateWindowDisturbed = false;
+    this._resamplerActivelyTracking = false;
+    this._resamplerUpdates = 0;
+    this._measuredRateRatio = 1.0;
+    this._baseRateRatio = 1.0;
+    this._targetRateRatio = 1.0;
+    this._appliedRateRatio = 1.0;
+    this._lastFillCorrectionPpm = 0;
   }
 
   enqueue(samples, srcChannels) {
@@ -141,6 +176,7 @@ class PlayoutChain {
     const sc = srcChannels || this._channels;
     const frames = Math.floor(interleaved.length / sc);
     if (frames > 0) this._lastPacketFrames = frames;
+    this._framesWrittenForRate += frames;
 
     for (let f = 0; f < frames; f++) {
       const wp = (this._writePos + f) % this._ringSize;
@@ -171,6 +207,7 @@ class PlayoutChain {
     this._filledLpInit = false;
     this._driftHoldTicks = DRIFT_REARM_HOLD_TICKS;
     this._driftEventCooldownTicks = DRIFT_MIN_EVENT_TICKS;
+    this._rateWindowDisturbed = true;
     this._emit({ type: 'buffer', filled: this._filled, ringSize: this._ringSize, target: this.currentTargetFrames });
   }
 
@@ -179,6 +216,7 @@ class PlayoutChain {
       armed: this._armed,
       filled: this._filled,
       target: this.currentTargetFrames,
+      servoTarget: this._servoTargetFrames(),
       ringSize: this._ringSize,
       driftSkips: this._driftSkips,
       driftRepeats: this._driftRepeats,
@@ -187,10 +225,19 @@ class PlayoutChain {
       driftHoldTicks: this._driftHoldTicks,
       driftEventCooldownTicks: this._driftEventCooldownTicks,
       rearmTrimFrames: this._rearmTrimFrames,
+      partialUnderruns: this._partialUnderruns,
       clickTrimFrames: this._clickTrimFrames,
       clickTrimFires: this._clickTrimFires,
       clickTrimThreshold: this.currentTargetFrames + this._effectiveClickTrimMargin(),
       lastPacketFrames: this._lastPacketFrames,
+      resamplerRatio: this._appliedRateRatio,
+      resamplerBaseRatio: this._baseRateRatio,
+      resamplerTargetRatio: this._targetRateRatio,
+      resamplerMeasuredRatio: this._measuredRateRatio,
+      resamplerUpdates: this._resamplerUpdates,
+      resamplerActive: this._resamplerActivelyTracking,
+      resamplerFillCorrectionPpm: this._lastFillCorrectionPpm,
+      resamplerFrac: this._resampleFrac,
     };
   }
 
@@ -201,6 +248,109 @@ class PlayoutChain {
     // arrival sawtooth doesn't false-trim, plus a target-sized headroom so the
     // drift integrator has room to drain small overhead before the snap fires.
     return Math.max(this._lastPacketFrames, this.currentTargetFrames);
+  }
+
+  _markRateDisturbed() {
+    this._rateWindowDisturbed = true;
+  }
+
+  _lowLatencyCushionFrames() {
+    return Math.max(0, Math.min(
+      Math.round(this._lastPacketFrames / 2),
+      Math.round(this.currentTargetFrames / 6)
+    ));
+  }
+
+  _servoTargetFrames() {
+    return Math.min(this._ringSize, this.currentTargetFrames + this._lowLatencyCushionFrames());
+  }
+
+  _resetRateEstimator() {
+    this._resampleFrac = 0;
+    this._rateWindowStartOutput = this._framesOutputForRate;
+    this._rateWindowStartWritten = this._framesWrittenForRate;
+    this._rateWindowActive = true;
+    this._rateWindowDisturbed = false;
+    this._resamplerActivelyTracking = false;
+    this._resamplerUpdates = 0;
+    this._measuredRateRatio = 1.0;
+    this._baseRateRatio = 1.0;
+    this._targetRateRatio = 1.0;
+    this._appliedRateRatio = 1.0;
+    this._lastFillCorrectionPpm = 0;
+  }
+
+  _updateResamplerRate(quantum) {
+    if (!this._rateWindowActive) this._resetRateEstimator();
+
+    const outputDelta = this._framesOutputForRate - this._rateWindowStartOutput;
+    const windowSec = this._resamplerActivelyTracking ? RESAMPLER_WINDOW_SEC : RESAMPLER_FIRST_WINDOW_SEC;
+    if (outputDelta >= this.sampleRate * windowSec) {
+      const writtenDelta = this._framesWrittenForRate - this._rateWindowStartWritten;
+      if (!this._rateWindowDisturbed && outputDelta > 0 && writtenDelta > 0) {
+        const measured = writtenDelta / outputDelta;
+        const measuredPpm = Math.abs((measured - 1.0) * 1e6);
+        if (measured >= RESAMPLER_RATIO_MIN && measured <= RESAMPLER_RATIO_MAX
+            && measuredPpm <= RESAMPLER_MEASURED_MAX_PPM) {
+          this._measuredRateRatio = measured;
+          if (!this._resamplerActivelyTracking) {
+            this._baseRateRatio = measured;
+            this._resamplerActivelyTracking = true;
+          } else {
+            this._baseRateRatio = (1.0 - RESAMPLER_RATIO_SMOOTHING_NEW) * this._baseRateRatio
+              + RESAMPLER_RATIO_SMOOTHING_NEW * measured;
+          }
+          this._resamplerUpdates++;
+          this._emit({
+            type: 'resampler',
+            ratio: this._appliedRateRatio,
+            baseRatio: this._baseRateRatio,
+            measuredRatio: this._measuredRateRatio,
+            targetRatio: this._targetRateRatio,
+            updates: this._resamplerUpdates,
+            filled: this._filled,
+            target: this.currentTargetFrames,
+          });
+        }
+      }
+      this._rateWindowStartOutput = this._framesOutputForRate;
+      this._rateWindowStartWritten = this._framesWrittenForRate;
+      this._rateWindowDisturbed = false;
+    }
+
+    if (!this._filledLpInit) {
+      this._filledLp = this._filled;
+      this._filledLpInit = true;
+    } else {
+      this._filledLp += DRIFT_FILL_ALPHA * (this._filled - this._filledLp);
+    }
+
+    const error = this._filledLp - this._servoTargetFrames();
+    const deadband = this._driftDeadbandFrames(quantum);
+    let controlled = 0;
+    if (error > deadband) controlled = error - deadband;
+    else if (error < -deadband) controlled = error + deadband;
+
+    const maxCorrection = RESAMPLER_FILL_MAX_PPM / 1e6;
+    let fillCorrection = controlled / (this.sampleRate * RESAMPLER_FILL_CORRECTION_SEC);
+    if (fillCorrection > maxCorrection) fillCorrection = maxCorrection;
+    else if (fillCorrection < -maxCorrection) fillCorrection = -maxCorrection;
+    this._lastFillCorrectionPpm = fillCorrection * 1e6;
+
+    this._targetRateRatio = this._baseRateRatio + fillCorrection;
+    if (this._targetRateRatio < RESAMPLER_RATIO_MIN) this._targetRateRatio = RESAMPLER_RATIO_MIN;
+    else if (this._targetRateRatio > RESAMPLER_RATIO_MAX) this._targetRateRatio = RESAMPLER_RATIO_MAX;
+
+    this._appliedRateRatio += (this._targetRateRatio - this._appliedRateRatio) * RESAMPLER_RATIO_SLEW;
+    if (this._appliedRateRatio < RESAMPLER_RATIO_MIN) this._appliedRateRatio = RESAMPLER_RATIO_MIN;
+    else if (this._appliedRateRatio > RESAMPLER_RATIO_MAX) this._appliedRateRatio = RESAMPLER_RATIO_MAX;
+  }
+
+  _inputNeededForResampler(quantum) {
+    const end = this._resampleFrac + Math.max(0, quantum - 1) * this._appliedRateRatio;
+    const whole = Math.floor(end);
+    const frac = end - whole;
+    return whole + (frac > 1e-9 ? 2 : 1);
   }
 
   _applyClickTrimIfNeeded() {
@@ -230,6 +380,8 @@ class PlayoutChain {
     this._filledLpInit = false;
     this._driftHoldTicks = DRIFT_REARM_HOLD_TICKS;
     this._driftEventCooldownTicks = DRIFT_MIN_EVENT_TICKS;
+    this._resampleFrac = 0;
+    this._markRateDisturbed();
     this._emit({
       type: 'click-trim',
       dropped,
@@ -243,12 +395,14 @@ class PlayoutChain {
   }
 
   _trimStaleFramesForArm() {
-    const keep = clampTarget(this.currentTargetFrames);
+    const keep = this._servoTargetFrames();
     if (this._filled <= keep) return 0;
     const drop = this._filled - keep;
     this._readPos = (this._writePos - keep + this._ringSize) % this._ringSize;
     this._filled = keep;
     this._rearmTrimFrames += drop;
+    this._resampleFrac = 0;
+    this._markRateDisturbed();
     this._emit({
       type: 'rearm-trim',
       dropped: drop,
@@ -282,6 +436,8 @@ class PlayoutChain {
     this._filledLpInit = false;
     this._driftHoldTicks = armed ? DRIFT_REARM_HOLD_TICKS : 0;
     this._driftEventCooldownTicks = armed ? DRIFT_MIN_EVENT_TICKS : 0;
+    if (armed) this._resetRateEstimator();
+    else this._markRateDisturbed();
     this._emit({ type: 'arming', armed, filled: this._filled, ringSize: this._ringSize, target: this.currentTargetFrames });
   }
 
@@ -289,7 +445,16 @@ class PlayoutChain {
     this._statusTicks++;
     if (this._statusTicks < BUFFER_STATUS_TICKS) return;
     this._statusTicks = 0;
-    this._emit({ type: 'buffer', filled: this._filled, ringSize: this._ringSize, target: this.currentTargetFrames });
+    this._emit({
+      type: 'buffer',
+      filled: this._filled,
+      ringSize: this._ringSize,
+      target: this.currentTargetFrames,
+      ratio: this._appliedRateRatio,
+      baseRatio: this._baseRateRatio,
+      targetRatio: this._targetRateRatio,
+      updates: this._resamplerUpdates,
+    });
   }
 
   _writeConcealmentFadeOut(output, quantum) {
@@ -311,7 +476,7 @@ class PlayoutChain {
     quantum = quantum != null ? quantum : (output[0] ? output[0].length : 128);
 
     if (!this._armed) {
-      if (this._filled < this.currentTargetFrames) {
+      if (this._filled < this._servoTargetFrames()) {
         for (const ch of output) ch.fill(0);
         this._postBufferStatus();
         return;
@@ -319,93 +484,47 @@ class PlayoutChain {
       this._setArmed(true);
     }
 
-    if (this._filled < quantum) {
-      if (!this._inConcealment) {
-        this._writeConcealmentFadeOut(output, quantum);
-        this._inConcealment = true;
-      } else {
-        for (const ch of output) ch.fill(0);
-      }
-      this._emit({ type: 'underrun', filled: this._filled, needed: quantum, target: this.currentTargetFrames });
-      this._consecutiveUnderruns++;
-      if (this._consecutiveUnderruns >= REARM_UNDERRUN_TICKS) this._setArmed(false);
-      return;
-    }
-
     // Click-trim safety net: snap _readPos forward if fill has accumulated
     // beyond target + margin (gap recovery, sustained burst, etc.). Restores
     // the latency contract instantly; cosine crossfade in the render block
-    // below masks the splice. Must run BEFORE the drift integrator so the
-    // integrator sees the post-trim state, not the stale overhead.
+    // below masks the splice. Must run before the resampler reads the ring.
     this._applyClickTrimIfNeeded();
 
-    // extra: +1 = skip one source frame this quantum (drain by one),
-    //        -1 = repeat one frame (grow by one).
-    let extra = 0;
     if (this._driftHoldTicks > 0) {
       this._driftHoldTicks--;
       this._driftAcc = 0;
       this._filledLp = this._filled;
       this._filledLpInit = true;
     } else {
-      // Drift integrator (Layer C). Runs every armed, data-bearing quantum.
-      // LP-filter the observed fill so the WebRTC burst sawtooth doesn't
-      // masquerade as drift. Initialise the LP to the current fill on first
-      // tick (and after every re-arm) to skip the long startup transient.
-      if (!this._filledLpInit) {
-        this._filledLp = this._filled;
-        this._filledLpInit = true;
-      } else {
-        this._filledLp += DRIFT_FILL_ALPHA * (this._filled - this._filledLp);
-      }
+      this._updateResamplerRate(quantum);
+    }
 
-      const error = this._filledLp - this.currentTargetFrames;
-      const absErr = error >= 0 ? error : -error;
-      const deadband = this._driftDeadbandFrames(quantum);
-      if (absErr <= deadband) {
-        // Decay stale accumulator so a brief packet-phase excursion does not
-        // fire later after conditions have returned to normal.
-        this._driftAcc *= 0.98;
-        if (this._driftAcc > -0.001 && this._driftAcc < 0.001) this._driftAcc = 0;
+    const needed = this._inputNeededForResampler(quantum);
+    const inputLimited = this._filled < needed;
+    if (this._filled <= 0) {
+      if (!this._inConcealment) {
+        this._writeConcealmentFadeOut(output, quantum);
+        this._inConcealment = true;
       } else {
-        const controlledError = error > 0 ? error - deadband : error + deadband;
-        const controlledAbs = controlledError >= 0 ? controlledError : -controlledError;
-        const gainScale = controlledAbs <= DRIFT_SMALL_ERROR_FRAMES
-          ? 1
-          : Math.min(controlledAbs / DRIFT_SMALL_ERROR_FRAMES, DRIFT_MAX_GAIN_SCALE);
-        this._driftAcc += controlledError * (quantum / this.sampleRate) * DRIFT_GAIN_BASE * gainScale;
-        if (this._driftAcc > DRIFT_ACC_CLAMP) this._driftAcc = DRIFT_ACC_CLAMP;
-        else if (this._driftAcc < -DRIFT_ACC_CLAMP) this._driftAcc = -DRIFT_ACC_CLAMP;
+        for (const ch of output) ch.fill(0);
       }
-
-      if (this._driftEventCooldownTicks > 0) this._driftEventCooldownTicks--;
-      if (this._driftEventCooldownTicks <= 0 && this._driftAcc >= 1 && this._filled >= quantum + 1) {
-        this._driftAcc -= 1;
-        this._driftSkips++;
-        this._driftEventCooldownTicks = DRIFT_MIN_EVENT_TICKS;
-        extra = 1;
-        this._emit({
-          type: 'drift', action: 'skip',
-          skips: this._driftSkips, repeats: this._driftRepeats,
-          acc: this._driftAcc, filled: this._filled,
-        });
-      } else if (this._driftEventCooldownTicks <= 0 && this._driftAcc <= -1) {
-        this._driftAcc += 1;
-        this._driftRepeats++;
-        this._driftEventCooldownTicks = DRIFT_MIN_EVENT_TICKS;
-        extra = -1;
-        this._emit({
-          type: 'drift', action: 'repeat',
-          skips: this._driftSkips, repeats: this._driftRepeats,
-          acc: this._driftAcc, filled: this._filled,
-        });
-      }
+      this._emit({ type: 'underrun', filled: this._filled, needed, target: this.currentTargetFrames });
+      this._markRateDisturbed();
+      this._resampleFrac = 0;
+      this._consecutiveUnderruns++;
+      if (this._consecutiveUnderruns >= REARM_UNDERRUN_TICKS) this._setArmed(false);
+      return;
+    }
+    if (inputLimited) {
+      // A small input shortfall near packet boundaries is better rendered by
+      // holding the last available sample for the tail of this quantum than by
+      // dropping the whole quantum into concealment.
+      this._partialUnderruns++;
+      this._markRateDisturbed();
     }
 
     // First quantum back after concealment: cosine fade-in on the first
-    // CONCEAL_FADE_FRAMES samples. Drift skip/repeat still applies to the
-    // last DRIFT_XFADE_FRAMES samples; the two windows don't overlap at
-    // standard quanta (128) since 32 + 8 < 128.
+    // CONCEAL_FADE_FRAMES samples.
     const inFadeIn = this._inConcealment || this._fadeInOnNextRead;
     this._inConcealment = false;
     this._fadeInOnNextRead = false;
@@ -415,17 +534,15 @@ class PlayoutChain {
     // splice was caused by overhead, not silence).
     const inClickTrimXfade = this._pendingClickTrimXfade && !inFadeIn;
     this._pendingClickTrimXfade = false;
-    const xfadeStart = quantum - DRIFT_XFADE_FRAMES;
+    const ratio = this._appliedRateRatio;
     for (let f = 0; f < quantum; f++) {
-      const rp = (this._readPos + f) % this._ringSize;
-      let neighbourIdx = rp;
-      let w = 0;
-      if (extra !== 0 && f >= xfadeStart) {
-        w = this._driftXfade[f - xfadeStart];
-        neighbourIdx = extra === 1
-          ? (rp + 1) % this._ringSize
-          : (rp - 1 + this._ringSize) % this._ringSize;
-      }
+      const srcPos = this._resampleFrac + f * ratio;
+      const rawI0 = Math.floor(srcPos);
+      const i0 = rawI0 < this._filled ? rawI0 : this._filled - 1;
+      const frac = rawI0 === i0 ? srcPos - rawI0 : 0;
+      const i1 = (i0 + 1) < this._filled ? i0 + 1 : i0;
+      const rp0 = (this._readPos + i0) % this._ringSize;
+      const rp1 = (this._readPos + i1) % this._ringSize;
       let preFadeGain = 1;
       if (inFadeIn && f < CONCEAL_FADE_FRAMES) {
         const t = (f + 1) / CONCEAL_FADE_FRAMES;
@@ -433,8 +550,9 @@ class PlayoutChain {
       }
       for (let c = 0; c < output.length; c++) {
         const rc = c < this._channels ? c : this._channels - 1;
-        const v = this._ring[rc][rp];
-        const blended = w === 0 ? v : ((1 - w) * v + w * this._ring[rc][neighbourIdx]);
+        const a = this._ring[rc][rp0];
+        const b = this._ring[rc][rp1];
+        const blended = frac === 0 ? a : (a + (b - a) * frac);
         let out = blended * preFadeGain;
         if (inClickTrimXfade && f < CLICK_TRIM_FADE_FRAMES) {
           const t = (f + 1) / CLICK_TRIM_FADE_FRAMES;
@@ -445,13 +563,18 @@ class PlayoutChain {
         output[c][f] = out;
       }
     }
-    const consumed = quantum + extra;
+    const advance = this._resampleFrac + quantum * ratio;
+    let consumed = Math.floor(advance);
+    this._resampleFrac = advance - consumed;
+    if (consumed > this._filled) {
+      consumed = this._filled;
+      this._resampleFrac = 0;
+    }
     this._readPos = (this._readPos + consumed) % this._ringSize;
     this._filled -= consumed;
+    this._framesOutputForRate += quantum;
 
-    // Stash trailing sample for the next potential fade-out. After a drift
-    // skip the trailing sample is the post-blend output we wrote, which is
-    // already in output[c][quantum-1].
+    // Stash trailing sample for the next potential fade-out.
     for (let c = 0; c < output.length; c++) {
       const rc = c < this._channels ? c : this._channels - 1;
       this._lastOutSample[rc] = output[c][quantum - 1];
@@ -485,6 +608,15 @@ if (typeof module !== 'undefined' && module.exports) {
     DRIFT_REARM_HOLD_TICKS,
     DRIFT_MIN_EVENT_TICKS,
     DRIFT_FILL_ALPHA,
+    RESAMPLER_WINDOW_SEC,
+    RESAMPLER_FIRST_WINDOW_SEC,
+    RESAMPLER_RATIO_SMOOTHING_NEW,
+    RESAMPLER_RATIO_MIN,
+    RESAMPLER_RATIO_MAX,
+    RESAMPLER_MEASURED_MAX_PPM,
+    RESAMPLER_FILL_CORRECTION_SEC,
+    RESAMPLER_FILL_MAX_PPM,
+    RESAMPLER_RATIO_SLEW,
     CLICK_TRIM_FADE_FRAMES,
   };
 }

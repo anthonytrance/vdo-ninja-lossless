@@ -89,22 +89,39 @@ const DRIFT_FILL_ALPHA = 0.0025;
 // Fixed-ratio resampler drift correction. Ratio > 1 consumes input faster,
 // ratio < 1 stretches input. The counter window estimates sender/receiver
 // clock ratio. Buffer-fill error is diagnostic only; it must not modulate pitch.
-const RESAMPLER_WINDOW_SEC = 30.0;
-const RESAMPLER_FIRST_WINDOW_SEC = 30.0;
-const RESAMPLER_RATIO_SMOOTHING_NEW = 0.15;
+const RESAMPLER_WINDOW_SEC = 15.0;
+// First-lock window. Regression samples provide sub-packet rate estimates, and
+// the Windows MMCSS sender/receiver gates reduced transport jitter enough that
+// waiting 30 s burns too much low-latency buffer under real sound-card drift.
+// Keep it longer than the normal 15 s tracking window so one short noisy
+// low-latency window cannot dominate the first pitch decision.
+const RESAMPLER_FIRST_WINDOW_SEC = 20.0;
+const RESAMPLER_RATIO_SMOOTHING_NEW = 0.30;
 const RESAMPLER_RATIO_MIN = 0.995;       // +/-5000 ppm sanity reject.
 const RESAMPLER_RATIO_MAX = 1.005;
 const RESAMPLER_MEASURED_MAX_PPM = 500;  // Reject non-clock outliers, not real device drift.
-const RESAMPLER_MEASURED_DEADBAND_PPM = 40;
+// Two-stage deadband: absolute (vs unity) gates "is there drift at all"; once
+// the learner has trusted a non-unity ratio, the smaller residual deadband
+// allows fine-tracking instead of capping convergence at ±40 ppm of truth.
+const RESAMPLER_ABSOLUTE_DEADBAND_PPM = 40;
+const RESAMPLER_RESIDUAL_DEADBAND_PPM = 10;
 const RESAMPLER_LEARN_CONFIRM_WINDOWS = 2;
 const RESAMPLER_LEARN_AGREE_PPM = 75;
-const RESAMPLER_LEARN_MAX_STEP_PPM = 50;
+// 100 ppm/step lets a typical ±100 ppm sound-card mismatch be corrected in
+// a single window cycle after lock, instead of the 2-3 cycles the old 50 ppm
+// cap required. Each saved cycle is ~30 s of ring drain pressure on the
+// receiver-side buffer.
+const RESAMPLER_LEARN_MAX_STEP_PPM = 100;
+const RESAMPLER_REGRESSION_FIRST_LOCK_MAX_STEP_PPM = 100;
 const RESAMPLER_FILL_CORRECTION_SEC = 30.0;
 const RESAMPLER_FILL_MAX_PPM = 0;        // Do not let buffer fill modulate pitch.
 const RESAMPLER_RATIO_SLEW = 0.0025;     // About 1 s time constant at 48k/128.
 const RESAMPLER_STABLE_HOLD_SEC = 5.0;
+const RESAMPLER_REGRESSION_MIN_SAMPLES = 16;
+const RESAMPLER_REGRESSION_MAX_WINDOW_SEC = 45.0;
+const RESAMPLER_REGRESSION_MAX_RESIDUAL_PACKETS = 0.75;
 const LATENCY_TRIM_ARM_SEC = 2.0;
-const LATENCY_TRIM_STABLE_SEC = 3.0;
+const LATENCY_TRIM_STABLE_SEC = 8.0;
 
 function clampTarget(n) {
   if (!Number.isFinite(n)) return DEFAULT_TARGET_FRAMES;
@@ -185,6 +202,7 @@ class PlayoutChain {
     this._lastFillCorrectionPpm = 0;
     this._stableRenderFrames = 0;
     this._resamplerFillArmed = false;
+    this._rateSamples = [];
   }
 
   enqueue(samples, srcChannels) {
@@ -195,6 +213,7 @@ class PlayoutChain {
     const frames = Math.floor(interleaved.length / sc);
     if (frames > 0) this._lastPacketFrames = frames;
     this._framesWrittenForRate += frames;
+    this._recordRateSample();
 
     for (let f = 0; f < frames; f++) {
       const wp = (this._writePos + f) % this._ringSize;
@@ -263,6 +282,7 @@ class PlayoutChain {
       resamplerFillCorrectionPpm: this._lastFillCorrectionPpm,
       resamplerFrac: this._resampleFrac,
       resamplerStableSec: this._stableRenderFrames / this.sampleRate,
+      rateSampleCount: this._rateSamples.length,
     };
   }
 
@@ -329,6 +349,14 @@ class PlayoutChain {
 
   _resetRateEstimator() {
     const trusted = this._trustedRateRatio;
+    // Preserve any in-flight pending state across re-arm. Without this, a
+    // chain that briefly unarms during the pre-lock window throws away every
+    // partial confirmation it had built up and starts the 30 s first-window
+    // wait again from scratch. The pendingRateRatio is independent of arm
+    // state (it tracks the sender/receiver clock relationship, not the ring),
+    // so carrying it forward is safe.
+    const savedPendingRatio = this._pendingRateRatio;
+    const savedPendingConfirmations = this._pendingRateConfirmations;
     this._resampleFrac = 0;
     this._rateWindowStartOutput = this._framesOutputForRate;
     this._rateWindowStartWritten = this._framesWrittenForRate;
@@ -340,11 +368,12 @@ class PlayoutChain {
     this._baseRateRatio = trusted;
     this._targetRateRatio = trusted;
     this._appliedRateRatio = trusted;
-    this._pendingRateRatio = trusted;
-    this._pendingRateConfirmations = 0;
+    this._pendingRateRatio = savedPendingConfirmations > 0 ? savedPendingRatio : trusted;
+    this._pendingRateConfirmations = savedPendingConfirmations;
     this._lastFillCorrectionPpm = 0;
     this._stableRenderFrames = 0;
     this._resamplerFillArmed = false;
+    this._rateSamples = [];
   }
 
   _clearPendingRate() {
@@ -356,6 +385,71 @@ class PlayoutChain {
     if (this._pendingRateConfirmations <= 0) return;
     this._pendingRateConfirmations -= 0.5;
     if (this._pendingRateConfirmations <= 0) this._clearPendingRate();
+  }
+
+  _recordRateSample() {
+    if (!Number.isFinite(this._framesOutputForRate) || !Number.isFinite(this._framesWrittenForRate)) return;
+    const samples = this._rateSamples;
+    const x = this._framesOutputForRate;
+    const y = this._framesWrittenForRate;
+    const last = samples[samples.length - 1];
+    if (last && last.x === x && last.y === y) return;
+    samples.push({ x, y });
+    const cutoff = x - Math.round(this.sampleRate * RESAMPLER_REGRESSION_MAX_WINDOW_SEC);
+    while (samples.length > 2 && samples[0].x < cutoff) samples.shift();
+  }
+
+  _measureRateRegression(startOutput, endOutput) {
+    const samples = this._rateSamples;
+    if (!samples || samples.length < RESAMPLER_REGRESSION_MIN_SAMPLES) return null;
+    let start = 0;
+    while (start < samples.length - 1 && samples[start].x < startOutput) start++;
+    const count = samples.length - start;
+    if (count < RESAMPLER_REGRESSION_MIN_SAMPLES) return null;
+    const first = samples[start];
+    const last = samples[samples.length - 1];
+    const span = Math.min(endOutput, last.x) - first.x;
+    if (span < this.sampleRate * RESAMPLER_WINDOW_SEC * 0.75) return null;
+
+    let sumX = 0;
+    let sumY = 0;
+    for (let i = start; i < samples.length; i++) {
+      sumX += samples[i].x - first.x;
+      sumY += samples[i].y - first.y;
+    }
+    const meanX = sumX / count;
+    const meanY = sumY / count;
+    let cov = 0;
+    let varX = 0;
+    for (let i = start; i < samples.length; i++) {
+      const dx = (samples[i].x - first.x) - meanX;
+      const dy = (samples[i].y - first.y) - meanY;
+      cov += dx * dy;
+      varX += dx * dx;
+    }
+    if (varX <= 0) return null;
+    const ratio = cov / varX;
+    if (!Number.isFinite(ratio) || ratio <= 0) return null;
+
+    let sse = 0;
+    for (let i = start; i < samples.length; i++) {
+      const x = samples[i].x - first.x;
+      const y = samples[i].y - first.y;
+      const residual = y - (meanY + ratio * (x - meanX));
+      sse += residual * residual;
+    }
+    const residualFrames = Math.sqrt(sse / count);
+    const residualLimit = Math.max(
+      this._lastPacketFrames * RESAMPLER_REGRESSION_MAX_RESIDUAL_PACKETS,
+      this.sampleRate * 0.004
+    );
+    if (residualFrames > residualLimit) return null;
+    return {
+      ratio,
+      count,
+      spanFrames: span,
+      residualFrames,
+    };
   }
 
   _emitResamplerStatus(source) {
@@ -387,14 +481,25 @@ class PlayoutChain {
     }
 
     const trusted = this._trustedRateRatio;
-    if (measuredPpm < RESAMPLER_MEASURED_DEADBAND_PPM) {
+    // Absolute deadband: when the learner has never locked away from unity,
+    // require a large measurement before we believe there is drift at all.
+    // This rejects per-window noise at ±40 ppm on a same-clock localhost rig.
+    if (!this._resamplerActivelyTracking && measuredPpm < RESAMPLER_ABSOLUTE_DEADBAND_PPM) {
       this._measuredRateRatio = trusted;
       this._decayPendingRate();
       return false;
     }
 
     const deltaPpm = (measured - trusted) * 1e6;
-    if (Math.abs(deltaPpm) < RESAMPLER_MEASURED_DEADBAND_PPM) {
+    const packetQuantizationPpm = !options.skipPacketQuantization && outputDelta > 0
+      ? (this._lastPacketFrames / outputDelta) * 1e6
+      : 0;
+    // Residual deadband: once we have a non-unity trusted ratio, allow much
+    // finer updates so convergence is NOT capped at ±40 ppm of truth.
+    const deadband = this._resamplerActivelyTracking
+      ? RESAMPLER_RESIDUAL_DEADBAND_PPM
+      : RESAMPLER_ABSOLUTE_DEADBAND_PPM;
+    if (Math.abs(deltaPpm) < deadband) {
       this._measuredRateRatio = trusted;
       this._decayPendingRate();
       return false;
@@ -402,9 +507,6 @@ class PlayoutChain {
 
     if (this._pendingRateConfirmations > 0) {
       const pendingDeltaPpm = (this._pendingRateRatio - trusted) * 1e6;
-      const packetQuantizationPpm = !options.skipPacketQuantization && outputDelta > 0
-        ? (this._lastPacketFrames / outputDelta) * 1e6
-        : 0;
       const agreePpm = Math.max(RESAMPLER_LEARN_AGREE_PPM, packetQuantizationPpm * 1.25);
       const agree = Math.sign(deltaPpm) === Math.sign(pendingDeltaPpm)
         && Math.abs((measured - this._pendingRateRatio) * 1e6) <= agreePpm;
@@ -421,22 +523,36 @@ class PlayoutChain {
       this._pendingRateConfirmations = 1;
     }
 
-    if (this._pendingRateConfirmations < RESAMPLER_LEARN_CONFIRM_WINDOWS) {
+    // First lock normally needs confirmation because one packet of window
+    // quantization can look like drift. Allow a single-window fast lock only
+    // when the measurement is clearly larger than that quantization floor.
+    // Once the chain IS actively tracking, residual updates still need 2
+    // confirmations to defend against jitter-driven flipping near the true rate.
+    const firstLockClearlyAboveNoise = !this._resamplerActivelyTracking
+      && measuredPpm >= Math.max(RESAMPLER_ABSOLUTE_DEADBAND_PPM * 2, packetQuantizationPpm * 1.25);
+    const requiredConfirmations = this._resamplerActivelyTracking
+      ? RESAMPLER_LEARN_CONFIRM_WINDOWS
+      : (firstLockClearlyAboveNoise ? 1 : RESAMPLER_LEARN_CONFIRM_WINDOWS);
+    if (this._pendingRateConfirmations < requiredConfirmations) {
       this._measuredRateRatio = this._pendingRateRatio;
       return false;
     }
 
     this._measuredRateRatio = this._pendingRateRatio;
     const previous = this._trustedRateRatio;
+    const wasTracking = this._resamplerActivelyTracking;
     let next;
-    if (!this._resamplerActivelyTracking) {
+    if (!wasTracking) {
       next = this._measuredRateRatio;
       this._resamplerActivelyTracking = true;
     } else {
       next = (1.0 - RESAMPLER_RATIO_SMOOTHING_NEW) * this._baseRateRatio
         + RESAMPLER_RATIO_SMOOTHING_NEW * this._measuredRateRatio;
     }
-    const maxStep = RESAMPLER_LEARN_MAX_STEP_PPM / 1e6;
+    const maxStepPpm = (!wasTracking && options.skipPacketQuantization)
+      ? RESAMPLER_REGRESSION_FIRST_LOCK_MAX_STEP_PPM
+      : RESAMPLER_LEARN_MAX_STEP_PPM;
+    const maxStep = maxStepPpm / 1e6;
     if (next > previous + maxStep) next = previous + maxStep;
     else if (next < previous - maxStep) next = previous - maxStep;
     this._baseRateRatio = next;
@@ -470,6 +586,7 @@ class PlayoutChain {
       this._pendingRateConfirmations = 0;
       this._lastFillCorrectionPpm = 0;
       this._resamplerFillArmed = false;
+      this._rateSamples = [];
       this._rateWindowStartOutput = this._framesOutputForRate;
       this._rateWindowStartWritten = this._framesWrittenForRate;
       this._rateWindowDisturbed = false;
@@ -481,8 +598,31 @@ class PlayoutChain {
     if (outputDelta >= this.sampleRate * windowSec) {
       const writtenDelta = this._framesWrittenForRate - this._rateWindowStartWritten;
       if (outputDelta > 0 && writtenDelta > 0) {
-        const measured = writtenDelta / outputDelta;
-        if (this._acceptMeasuredRate(measured, outputDelta)) {
+        const regression = this._measureRateRegression(this._rateWindowStartOutput, this._framesOutputForRate);
+        const measured = regression ? regression.ratio : writtenDelta / outputDelta;
+        const accepted = this._acceptMeasuredRate(measured, regression ? 0 : outputDelta, {
+          skipPacketQuantization: !!regression,
+        });
+        this._emit({
+          type: 'rate-window',
+          measured,
+          measuredPpm: (measured - 1) * 1e6,
+          trusted: this._trustedRateRatio,
+          accepted,
+          pending: this._pendingRateConfirmations,
+          base: this._baseRateRatio,
+          activelyTracking: this._resamplerActivelyTracking,
+          outputDelta,
+          writtenDelta,
+          windowSec,
+          measurementSource: regression ? 'regression' : 'endpoint',
+          regressionSamples: regression ? regression.count : 0,
+          regressionSpanFrames: regression ? regression.spanFrames : 0,
+          regressionResidualFrames: regression ? regression.residualFrames : 0,
+          filled: this._filled,
+          target: this.currentTargetFrames,
+        });
+        if (accepted) {
           this._emitResamplerStatus('counter');
         }
       }
@@ -723,7 +863,21 @@ class PlayoutChain {
     // splice was caused by overhead, not silence).
     const inClickTrimXfade = this._pendingClickTrimXfade && !inFadeIn;
     this._pendingClickTrimXfade = false;
-    const ratio = this._appliedRateRatio;
+    let ratio = this._appliedRateRatio;
+    if (inputLimited) {
+      // Stretch the remaining input across this quantum instead of clamping
+      // the tail to one held sample. This keeps a short callback stall from
+      // turning a one-packet edge miss into a hard discontinuity.
+      if (this._filled > 1) {
+        const availableSpan = Math.max(0, this._filled - 1 - this._resampleFrac);
+        const stretchRatio = availableSpan / Math.max(1, quantum - 1);
+        if (Number.isFinite(stretchRatio) && stretchRatio > 0) {
+          ratio = Math.min(ratio, stretchRatio);
+        }
+      } else {
+        ratio = 0;
+      }
+    }
     for (let f = 0; f < quantum; f++) {
       const srcPos = this._resampleFrac + f * ratio;
       const rawI0 = Math.floor(srcPos);
@@ -754,6 +908,9 @@ class PlayoutChain {
     }
     const advance = this._resampleFrac + quantum * ratio;
     let consumed = Math.floor(advance);
+    if (inputLimited && this._filled > 0) {
+      consumed = Math.max(consumed, this._filled);
+    }
     this._resampleFrac = advance - consumed;
     if (consumed > this._filled) {
       consumed = this._filled;
@@ -808,10 +965,12 @@ if (typeof module !== 'undefined' && module.exports) {
     RESAMPLER_RATIO_MIN,
     RESAMPLER_RATIO_MAX,
     RESAMPLER_MEASURED_MAX_PPM,
-    RESAMPLER_MEASURED_DEADBAND_PPM,
+    RESAMPLER_ABSOLUTE_DEADBAND_PPM,
+    RESAMPLER_RESIDUAL_DEADBAND_PPM,
     RESAMPLER_LEARN_CONFIRM_WINDOWS,
     RESAMPLER_LEARN_AGREE_PPM,
     RESAMPLER_LEARN_MAX_STEP_PPM,
+    RESAMPLER_REGRESSION_FIRST_LOCK_MAX_STEP_PPM,
     RESAMPLER_FILL_CORRECTION_SEC,
     RESAMPLER_FILL_MAX_PPM,
     RESAMPLER_RATIO_SLEW,

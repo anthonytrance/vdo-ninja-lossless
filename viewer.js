@@ -13,14 +13,34 @@
 (function () {
   'use strict';
 
-  const VERSION     = '1.0.29';
+  const VERSION     = '1.0.30';
   const DEBUG_ON    = (() => {
     try {
-      const v = (new URLSearchParams(window.location.search)).get('debug');
-      return v === '1' || v === 'true';
+      const truthy = (v) => v === '1' || v === 'true';
+      const pageParams = new URLSearchParams(window.location.search);
+      for (const name of ['dcDebug', 'losslessDebug', 'debug']) {
+        const v = pageParams.get(name);
+        if (truthy(v)) return true;
+      }
+      for (const [, val] of pageParams) {
+        if (val && val.includes('viewer.js')) {
+          try {
+            const scriptUrl = new URL(val, window.location.href);
+            for (const name of ['dcDebug', 'losslessDebug', 'debug']) {
+              if (truthy(scriptUrl.searchParams.get(name))) return true;
+            }
+          } catch (_) {}
+        }
+      }
+      if (document.currentScript && document.currentScript.src) {
+        const scriptUrl = new URL(document.currentScript.src, window.location.href);
+        for (const name of ['dcDebug', 'losslessDebug', 'debug']) {
+          if (truthy(scriptUrl.searchParams.get(name))) return true;
+        }
+      }
     } catch (_) {
-      return false;
     }
+    return false;
   })();
   const DC_ID       = 42;
   const DC_LABEL    = 'lossless-audio-v1';
@@ -61,14 +81,31 @@
   // for different sizes and the publisher tailors its DC output to each.
   const REQUESTED_FRAME_MS = _numberParam(['dcFrame'], _profile.dcFrame || 10, 1, 100);
   const REQUESTED_FRAME_FRAMES = Math.max(1, Math.round(48000 * REQUESTED_FRAME_MS / 1000));
-  const DEFAULT_STARTUP_PREROLL_PACKETS = Math.max(2, Math.min(10,
+  const DEFAULT_REORDER_WINDOW_PACKETS = REQUESTED_FRAME_MS <= 3.1 ? 8 : (REQUESTED_FRAME_MS <= 5.5 ? 6 : 4);
+  const REORDER_WINDOW_PACKETS = Math.round(_numberParam(
+    ['dcReorderPackets', 'losslessReorderPackets'],
+    DEFAULT_REORDER_WINDOW_PACKETS,
+    0,
+    64
+  ));
+  const DEFAULT_STARTUP_PREROLL_PACKETS = Math.max(2, Math.min(64,
     Math.ceil((TARGET_BUFFER_FRAMES + Math.min(REQUESTED_FRAME_FRAMES, Math.round(TARGET_BUFFER_FRAMES / 4))) / REQUESTED_FRAME_FRAMES)
   ));
-  const STARTUP_PREROLL_PACKETS = Math.round(_numberParam(['losslessPreroll'], DEFAULT_STARTUP_PREROLL_PACKETS, 1, 10));
+  const STARTUP_PREROLL_PACKETS = Math.round(_numberParam(['losslessPreroll'], DEFAULT_STARTUP_PREROLL_PACKETS, 1, 64));
   const REQUESTED_FORMAT = (() => {
     const fmt = (_stringParam(['dcFormat']) || _profile.dcFormat || 'int16').toLowerCase();
     return (fmt === 'float32' || fmt === 'int16') ? fmt : 'int16';
   })();
+  const CLICK_TRIM_ENABLED = _boolParam(['dcClickTrim'], true);
+  const LATENCY_TRIM_ENABLED = _boolParam(['dcLatencyTrim'], false);
+  const RATE_LEARNING_ENABLED = _boolParam(['dcRateLearning'], false);
+  const DEFAULT_PROMOTE_DELAY_MS = TARGET_BUFFER_MS <= 25 ? 8000 : 0;
+  const PROMOTE_DELAY_MS = Math.round(_numberParam(
+    ['dcPromoteDelayMs', 'losslessPromoteDelayMs'],
+    DEFAULT_PROMOTE_DELAY_MS,
+    0,
+    30000
+  ));
 
   function log(msg)  { console.log(`[lossless-dc v${VERSION}] ${msg}`); }
   function warn(msg) { console.warn(`[lossless-dc v${VERSION}] ${msg}`); }
@@ -131,6 +168,15 @@
     return null;
   }
 
+  function _boolParam(names, fallback) {
+    const val = _stringParam(names);
+    if (val == null) return fallback;
+    const v = String(val).trim().toLowerCase();
+    if (v === '1' || v === 'true' || v === 'yes' || v === 'on') return true;
+    if (v === '0' || v === 'false' || v === 'no' || v === 'off') return false;
+    return fallback;
+  }
+
   // -------------------------------------------------------------------------
   // Worklet URL resolution
   // -------------------------------------------------------------------------
@@ -169,8 +215,9 @@
   function _newPeer(pc, dc) {
     return { pc, dc, stream: null, handshake: null, ackSent: false, audioEl: null,
              savedVolume: 1.0, gainNode: null,
-             lastFrameMs: 0, lastSeq: -1,
-             frames: 0, seqDrops: 0, audioUnderruns: 0, concealed: 0,
+             lastFrameMs: 0, lastSeq: -1, expectedSeq: -1,
+             pendingPackets: new Map(), lateDrops: 0, duplicateDrops: 0,
+             frames: 0, seqDrops: 0, audioUnderruns: 0, partialUnderruns: 0, concealed: 0,
              driftSkips: 0, driftRepeats: 0, rearmTrimFrames: 0, clickTrimFrames: 0,
              bytes: 0, opusRestored: false, bufferFrames: 0,
              resamplerRatio: 1.0, resamplerUpdates: 0,
@@ -190,6 +237,8 @@
              arrivalControlPendingMs: 0, arrivalControlLastSendMs: 0,
              arrivalControlSentRatio: 1.0, arrivalControlActive: false,
              lastGoodFrame: null, packetFrames: REQUESTED_FRAME_FRAMES,
+             reorderWindowPackets: REORDER_WINDOW_PACKETS,
+             acceptFrames: PROMOTE_DELAY_MS <= 0, promoteTimer: null,
              armed: false, losslessStarted: false, startupQueue: [],
              pollTimer: null };
   }
@@ -216,7 +265,7 @@
 
   async function _ensureAudio(sampleRate) {
     if (!_audioCtx) {
-      _audioCtx = new AudioContext({ sampleRate: sampleRate || 48000 });
+      _audioCtx = new AudioContext({ sampleRate: sampleRate || 48000, latencyHint: 0 });
       log(`AudioContext created @ ${_audioCtx.sampleRate} Hz (state: ${_audioCtx.state})`);
     }
     if (_audioCtx.state === 'suspended') {
@@ -245,7 +294,13 @@
     const wn = new AudioWorkletNode(_audioCtx, 'lossless-audio-processor', {
       numberOfInputs: 0, numberOfOutputs: 1,
       outputChannelCount: [channels],
-      processorOptions: { channels, targetFrames: TARGET_BUFFER_FRAMES },
+      processorOptions: {
+        channels,
+        targetFrames: TARGET_BUFFER_FRAMES,
+        clickTrim: CLICK_TRIM_ENABLED,
+        latencyTrim: LATENCY_TRIM_ENABLED,
+        rateLearning: RATE_LEARNING_ENABLED,
+      },
     });
     peer.targetFrames = TARGET_BUFFER_FRAMES;
     wn.port.onmessage = (ev) => {
@@ -311,6 +366,7 @@
     if (typeof m.active === 'boolean') peer.resamplerActive = m.active;
     if (typeof m.updates === 'number') peer.resamplerUpdates = m.updates;
     if (typeof m.source === 'string') peer.resamplerSource = m.source;
+    if (typeof m.partialUnderruns === 'number') peer.partialUnderruns = m.partialUnderruns;
   }
 
   function _resetArrivalEstimator(peer) {
@@ -444,6 +500,10 @@
   }
 
   function _maybeSendArrivalRateEstimate(peer, nowMs) {
+    if (!RATE_LEARNING_ENABLED) {
+      _resetArrivalControl(peer);
+      return;
+    }
     if (!peer.losslessStarted || !peer.arrivalValid15) {
       _resetArrivalControl(peer);
       return;
@@ -548,6 +608,118 @@
     if (gap > MAX_CONCEAL_PACKETS) warn(`Large DC gap: concealed ${MAX_CONCEAL_PACKETS}/${gap} packet(s), Opus fallback may be cleaner`);
   }
 
+  function _seqDistance(from, to) {
+    return (to - from + 65536) & 0xFFFF;
+  }
+
+  function _deliverPacketInOrder(peer, packet) {
+    if (packet.packetFrames > 0) peer.packetFrames = packet.packetFrames;
+    peer.lastSeq = packet.seq;
+    peer.lastFrameMs = Date.now();
+
+    if (!peer.losslessStarted) {
+      peer.startupQueue.push(packet);
+      if (peer.startupQueue.length < STARTUP_PREROLL_PACKETS) {
+        _updateOverlay();
+        return;
+      }
+      peer.losslessStarted = true;
+      _resetArrivalEstimator(peer);
+      log(`Startup preroll ready (${peer.startupQueue.length} packets) - lossless playback starts`);
+      for (const item of peer.startupQueue) {
+        _updateArrivalEstimator(peer, item.seq, item.packetFrames);
+        _postFrameToWorklet(peer, item.f32, item.byteLength);
+      }
+      peer.startupQueue = [];
+      _updateOverlay();
+      return;
+    }
+
+    _updateArrivalEstimator(peer, packet.seq, packet.packetFrames);
+    _postFrameToWorklet(peer, packet.f32, packet.byteLength);
+    _updateOverlay();
+  }
+
+  function _handleMissingExpectedPacket(peer) {
+    const missingSeq = peer.expectedSeq;
+    if (peer.losslessStarted) {
+      peer.seqDrops++;
+      warn(`Gap: 1 packet (expected seq ${missingSeq}, reorder window ${peer.reorderWindowPackets})`);
+      _concealGap(peer, 1);
+      peer.lastSeq = missingSeq;
+    } else {
+      peer.startupQueue = [];
+      log(`Startup preroll gap at seq ${missingSeq}; waiting for clean preroll`);
+    }
+    peer.expectedSeq = (peer.expectedSeq + 1) & 0xFFFF;
+  }
+
+  function _drainPendingPackets(peer) {
+    const pending = peer.pendingPackets;
+    while (peer.expectedSeq >= 0) {
+      const packet = pending.get(peer.expectedSeq);
+      if (!packet) break;
+      pending.delete(peer.expectedSeq);
+      _deliverPacketInOrder(peer, packet);
+      peer.expectedSeq = (peer.expectedSeq + 1) & 0xFFFF;
+    }
+    while (peer.expectedSeq >= 0 && pending.size > peer.reorderWindowPackets) {
+      _handleMissingExpectedPacket(peer);
+      while (pending.has(peer.expectedSeq)) {
+        const packet = pending.get(peer.expectedSeq);
+        pending.delete(peer.expectedSeq);
+        _deliverPacketInOrder(peer, packet);
+        peer.expectedSeq = (peer.expectedSeq + 1) & 0xFFFF;
+      }
+    }
+  }
+
+  function _handleDecodedPacket(peer, packet) {
+    if (!peer.acceptFrames) {
+      peer.lastFrameMs = Date.now();
+      return;
+    }
+    peer.lastFrameMs = Date.now();
+    if (peer.expectedSeq < 0) {
+      peer.expectedSeq = packet.seq;
+    } else {
+      const distance = _seqDistance(peer.expectedSeq, packet.seq);
+      if (distance > 32768) {
+        peer.lateDrops++;
+        return;
+      }
+    }
+    if (peer.pendingPackets.has(packet.seq)) {
+      peer.duplicateDrops++;
+      return;
+    }
+    peer.pendingPackets.set(packet.seq, packet);
+    _drainPendingPackets(peer);
+    _updateOverlay();
+  }
+
+  function _armLosslessPromotion(peer) {
+    if (PROMOTE_DELAY_MS <= 0) {
+      peer.acceptFrames = true;
+      return;
+    }
+    peer.acceptFrames = false;
+    if (peer.promoteTimer) clearTimeout(peer.promoteTimer);
+    log(`Lossless promotion delayed ${PROMOTE_DELAY_MS}ms for low-latency warm-up`);
+    peer.promoteTimer = setTimeout(() => {
+      peer.promoteTimer = null;
+      peer.acceptFrames = true;
+      peer.expectedSeq = -1;
+      peer.lastSeq = -1;
+      peer.losslessStarted = false;
+      peer.startupQueue = [];
+      peer.lastGoodFrame = null;
+      if (peer.pendingPackets) peer.pendingPackets.clear();
+      log('Lossless promotion window open');
+      _updateOverlay();
+    }, PROMOTE_DELAY_MS);
+  }
+
   // -------------------------------------------------------------------------
   // Opus muting / restore
   // -------------------------------------------------------------------------
@@ -601,6 +773,7 @@
     }
 
     if (peer.pollTimer) { clearInterval(peer.pollTimer); peer.pollTimer = null; }
+    if (peer.promoteTimer) { clearTimeout(peer.promoteTimer); peer.promoteTimer = null; }
     const wn = _workletNodes.get(peer.pc);
     if (wn)          { try { wn.disconnect();          } catch (_) {} _workletNodes.delete(peer.pc); }
     if (peer.gainNode) { try { peer.gainNode.disconnect(); } catch (_) {} peer.gainNode = null; }
@@ -645,6 +818,7 @@
         await _ensureAudio(hs.sampleRate);
         await _buildWorkletNode(peer);
         _sendLosslessAck(peer);
+        _armLosslessPromotion(peer);
         _updateOverlay();
       } catch (e) { warn(`Bad handshake: ${e.message}`); peer.dc.close(); }
       return;
@@ -665,22 +839,6 @@
     const fmt  = view.getUint8(4);
     if (packetFrames > 0) peer.packetFrames = packetFrames;
 
-    if (peer.lastSeq >= 0) {
-      const exp = (peer.lastSeq + 1) & 0xFFFF;
-      if (seq !== exp) {
-        const gap = (seq - exp + 65536) & 0xFFFF;
-        if (peer.losslessStarted) {
-          peer.seqDrops += gap;
-          warn(`Gap: ${gap} frame(s) (seq ${peer.lastSeq} → ${seq})`);
-          _concealGap(peer, gap);
-        } else {
-          peer.startupQueue = [];
-          log(`Startup preroll gap: ${gap} frame(s) (seq ${peer.lastSeq} → ${seq}); waiting for clean preroll`);
-        }
-      }
-    }
-    peer.lastSeq = seq; peer.lastFrameMs = Date.now();
-
     const payload = buf.slice(8);
     let f32;
     if (fmt === FMT_INT16) {
@@ -691,25 +849,7 @@
       f32 = new Float32Array(payload.slice(0));
     } else { return; }
 
-    if (!peer.losslessStarted) {
-      peer.startupQueue.push({ f32, byteLength: buf.byteLength });
-      if (peer.startupQueue.length < STARTUP_PREROLL_PACKETS) {
-        _updateOverlay();
-        return;
-      }
-      peer.losslessStarted = true;
-      _resetArrivalEstimator(peer);
-      _updateArrivalEstimator(peer, seq, peer.packetFrames);
-      log(`Startup preroll ready (${peer.startupQueue.length} packets) — lossless playback starts`);
-      for (const item of peer.startupQueue) _postFrameToWorklet(peer, item.f32, item.byteLength);
-      peer.startupQueue = [];
-      _updateOverlay();
-      return;
-    }
-
-    _updateArrivalEstimator(peer, seq, peer.packetFrames);
-    _postFrameToWorklet(peer, f32, buf.byteLength);
-    _updateOverlay();
+    _handleDecodedPacket(peer, { seq, packetFrames, fmt, f32, byteLength: buf.byteLength });
   }
 
   // -------------------------------------------------------------------------
@@ -720,7 +860,7 @@
     let dc;
     try {
       dc = pc.createDataChannel(DC_LABEL, {
-        id: DC_ID, negotiated: true, ordered: true, maxRetransmits: 0, protocol: DC_PROTOCOL,
+        id: DC_ID, negotiated: true, ordered: false, maxRetransmits: 0, protocol: DC_PROTOCOL,
       });
       dc.binaryType = 'arraybuffer';
     } catch (e) {
@@ -771,75 +911,78 @@
     return _origCreateAnswer.apply(this, args);
   };
 
-  // Test-harness debug hook (gated on &debug=1). Exposes _peers and version so
-  // the autonomous browser harness can read per-peer state without parsing the
-  // overlay text. Non-breaking — production loads don't set this.
+  // Test-harness debug hook. Exposes _peers and version so the autonomous
+  // browser harness can read per-peer state without parsing the overlay text.
+  // This stays available even when console-heavy debug logging is off.
   try {
-    if (DEBUG_ON) {
-      window.__LosslessDcDebug = Object.freeze({
-        get peers() { return _peers; },
-        get version() { return VERSION; },
-        get targetBufferMs() { return TARGET_BUFFER_MS; },
-        get requestedFrameMs() { return REQUESTED_FRAME_MS; },
-        get requestedFormat() { return REQUESTED_FORMAT; },
-        get dcMode() { return _dcMode || null; },
-        snapshot() {
-          const peers = [];
-          for (const [, p] of _peers) {
-            peers.push({
-              hasHandshake: !!p.handshake,
-              armed: !!p.armed,
-              losslessStarted: !!p.losslessStarted,
-              opusRestored: !!p.opusRestored,
-              frames: p.frames, bytes: p.bytes,
-              seqDrops: p.seqDrops, audioUnderruns: p.audioUnderruns,
-              concealed: p.concealed,
-              driftSkips: p.driftSkips, driftRepeats: p.driftRepeats,
-              rearmTrimFrames: p.rearmTrimFrames, clickTrimFrames: p.clickTrimFrames,
-              bufferFrames: p.bufferFrames, targetFrames: p.targetFrames || 0,
-              resamplerRatio: p.resamplerRatio || 1.0,
-              resamplerBaseRatio: p.resamplerBaseRatio || 1.0,
-              resamplerTrustedRatio: p.resamplerTrustedRatio || 1.0,
-              resamplerMeasuredRatio: p.resamplerMeasuredRatio || 1.0,
-              resamplerPendingRatio: p.resamplerPendingRatio || 1.0,
-              resamplerPendingConfirmations: p.resamplerPendingConfirmations || 0,
-              resamplerTargetRatio: p.resamplerTargetRatio || 1.0,
-              resamplerStableSec: p.resamplerStableSec || 0,
-              resamplerActive: !!p.resamplerActive,
-              resamplerUpdates: p.resamplerUpdates || 0,
-              resamplerSource: p.resamplerSource || '',
-              arrivalRatio15: p.arrivalRatio15 || 1.0,
-              arrivalRatio30: p.arrivalRatio30 || 1.0,
-              arrivalAgeSec: p.arrivalStartMs ? ((performance.now() - p.arrivalStartMs) / 1000) : 0,
-              arrivalJitterMs15: p.arrivalJitterMs15 || 0,
-              arrivalJitterMs30: p.arrivalJitterMs30 || 0,
-              arrivalSpanSec15: p.arrivalSpanSec15 || 0,
-              arrivalSpanSec30: p.arrivalSpanSec30 || 0,
-              arrivalSamples15: p.arrivalSamples15 || 0,
-              arrivalSamples30: p.arrivalSamples30 || 0,
-              arrivalValid15: !!p.arrivalValid15,
-              arrivalValid30: !!p.arrivalValid30,
-              arrivalSeqGaps: p.arrivalSeqGaps || 0,
-              arrivalResets: p.arrivalResets || 0,
-              arrivalControlPendingRatio: p.arrivalControlPendingRatio || 1.0,
-              arrivalControlConfirmations: p.arrivalControlConfirmations || 0,
-              arrivalControlSentRatio: p.arrivalControlSentRatio || 1.0,
-              arrivalControlActive: !!p.arrivalControlActive,
-              lastFrameMs: p.lastFrameMs, lastSeq: p.lastSeq,
-            });
-          }
-          return { version: VERSION, peers };
-        },
-      });
-      log('debug hook installed at window.__LosslessDcDebug');
-    }
+    window.__LosslessDcDebug = Object.freeze({
+      get peers() { return _peers; },
+      get version() { return VERSION; },
+      get targetBufferMs() { return TARGET_BUFFER_MS; },
+      get requestedFrameMs() { return REQUESTED_FRAME_MS; },
+      get requestedFormat() { return REQUESTED_FORMAT; },
+      get dcMode() { return _dcMode || null; },
+      snapshot() {
+        const peers = [];
+        for (const [, p] of _peers) {
+          peers.push({
+            hasHandshake: !!p.handshake,
+            armed: !!p.armed,
+            losslessStarted: !!p.losslessStarted,
+            opusRestored: !!p.opusRestored,
+            frames: p.frames, bytes: p.bytes,
+            seqDrops: p.seqDrops, audioUnderruns: p.audioUnderruns,
+            concealed: p.concealed, partialUnderruns: p.partialUnderruns || 0,
+            lateDrops: p.lateDrops || 0, duplicateDrops: p.duplicateDrops || 0,
+            pendingPackets: p.pendingPackets ? p.pendingPackets.size : 0,
+            reorderWindowPackets: p.reorderWindowPackets || 0,
+            driftSkips: p.driftSkips, driftRepeats: p.driftRepeats,
+            rearmTrimFrames: p.rearmTrimFrames, clickTrimFrames: p.clickTrimFrames,
+            bufferFrames: p.bufferFrames, targetFrames: p.targetFrames || 0,
+            resamplerRatio: p.resamplerRatio || 1.0,
+            resamplerBaseRatio: p.resamplerBaseRatio || 1.0,
+            resamplerTrustedRatio: p.resamplerTrustedRatio || 1.0,
+            resamplerMeasuredRatio: p.resamplerMeasuredRatio || 1.0,
+            resamplerPendingRatio: p.resamplerPendingRatio || 1.0,
+            resamplerPendingConfirmations: p.resamplerPendingConfirmations || 0,
+            resamplerTargetRatio: p.resamplerTargetRatio || 1.0,
+            resamplerStableSec: p.resamplerStableSec || 0,
+            resamplerActive: !!p.resamplerActive,
+            resamplerUpdates: p.resamplerUpdates || 0,
+            resamplerSource: p.resamplerSource || '',
+            arrivalRatio15: p.arrivalRatio15 || 1.0,
+            arrivalRatio30: p.arrivalRatio30 || 1.0,
+            arrivalAgeSec: p.arrivalStartMs ? ((performance.now() - p.arrivalStartMs) / 1000) : 0,
+            arrivalJitterMs15: p.arrivalJitterMs15 || 0,
+            arrivalJitterMs30: p.arrivalJitterMs30 || 0,
+            arrivalSpanSec15: p.arrivalSpanSec15 || 0,
+            arrivalSpanSec30: p.arrivalSpanSec30 || 0,
+            arrivalSamples15: p.arrivalSamples15 || 0,
+            arrivalSamples30: p.arrivalSamples30 || 0,
+            arrivalValid15: !!p.arrivalValid15,
+            arrivalValid30: !!p.arrivalValid30,
+            arrivalSeqGaps: p.arrivalSeqGaps || 0,
+            arrivalResets: p.arrivalResets || 0,
+            arrivalControlPendingRatio: p.arrivalControlPendingRatio || 1.0,
+            arrivalControlConfirmations: p.arrivalControlConfirmations || 0,
+            arrivalControlSentRatio: p.arrivalControlSentRatio || 1.0,
+            arrivalControlActive: !!p.arrivalControlActive,
+            lastFrameMs: p.lastFrameMs, lastSeq: p.lastSeq,
+          });
+        }
+        return { version: VERSION, peers };
+      },
+    });
+    if (DEBUG_ON) log('debug hook installed at window.__LosslessDcDebug');
   } catch (_) {}
 
   log('RTCPeerConnection prototype patched — lossless DC ready');
   log(`Latency profile: ${_dcMode ? `dcMode=${_dcMode} → ` : ''}` +
     `dcBuffer=${TARGET_BUFFER_MS}ms (target=${TARGET_BUFFER_FRAMES} frames) ` +
     `dcFrame=${REQUESTED_FRAME_MS}ms dcFormat=${REQUESTED_FORMAT} ` +
-    `losslessPreroll=${STARTUP_PREROLL_PACKETS}`);
+    `losslessPreroll=${STARTUP_PREROLL_PACKETS} reorder=${REORDER_WINDOW_PACKETS} ` +
+    `promoteDelay=${PROMOTE_DELAY_MS}ms ` +
+    `clickTrim=${CLICK_TRIM_ENABLED ? 1 : 0} latencyTrim=${LATENCY_TRIM_ENABLED ? 1 : 0} rateLearning=${RATE_LEARNING_ENABLED ? 1 : 0}`);
 
   // -------------------------------------------------------------------------
   // Overlay — keyboard-accessible status panel + persistent Disable/Retry buttons.
@@ -892,7 +1035,7 @@
 
     _statsNode = document.createElement('div');
     _statsNode.setAttribute('data-lossless-stats', '');
-    _statsNode.textContent = 'Frames: 0  SeqDrops: 0  AudioUnderruns: 0 (0/min)  Drift: 0/0 (0/min)  RearmTrim: 0ms (0/min)  ClickTrim: 0ms (0/min)  Buffer: 0/0 armed 0ms / target 0ms  Ratio: 0ppm  ~0 kbps';
+    _statsNode.textContent = 'Frames: 0  SeqDrops: 0  Concealed: 0  AudioUnderruns: 0 (0/min)  Partial: 0  Drift: 0/0 (0/min)  RearmTrim: 0ms (0/min)  ClickTrim: 0ms (0/min)  Reorder: 0/0  Late: 0  Buffer: 0/0 armed 0ms / target 0ms  Ratio: 0ppm  ~0 kbps';
     _overlay.appendChild(_statsNode);
 
     const btnRow = document.createElement('div');
@@ -958,6 +1101,7 @@
     _ensureOverlay();
     if (!_overlay) return;
     let totalFrames = 0, totalSeqDrops = 0, totalAudioUnderruns = 0, totalConcealed = 0;
+    let totalPartialUnderruns = 0, totalLateDrops = 0, totalDuplicateDrops = 0, totalPendingPackets = 0, maxReorderWindow = 0;
     let totalDriftSkips = 0, totalDriftRepeats = 0, totalRearmTrimFrames = 0, totalClickTrimFrames = 0;
     let totalBytes = 0, armedCount = 0, losslessPeers = 0, minBufferFrames = null, maxTargetFrames = 0;
     let ratioSum = 0, ratioCount = 0, ratioUpdates = 0;
@@ -972,6 +1116,11 @@
       totalSeqDrops  += p.seqDrops;
       totalAudioUnderruns += p.audioUnderruns;
       totalConcealed += p.concealed;
+      totalPartialUnderruns += p.partialUnderruns || 0;
+      totalLateDrops += p.lateDrops || 0;
+      totalDuplicateDrops += p.duplicateDrops || 0;
+      totalPendingPackets += p.pendingPackets ? p.pendingPackets.size : 0;
+      maxReorderWindow = Math.max(maxReorderWindow, p.reorderWindowPackets || 0);
       totalDriftSkips   += p.driftSkips;
       totalDriftRepeats += p.driftRepeats;
       totalRearmTrimFrames += p.rearmTrimFrames || 0;
@@ -1046,7 +1195,7 @@
     const ctPerMinFrames = _ratePerMin(now, totalClickTrimFrames, 'ct');
     const rtPerMinMs = Math.round(rtPerMinFrames / 48);
     const ctPerMinMs = Math.round(ctPerMinFrames / 48);
-    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  SeqDrops: ${totalSeqDrops}  AudioUnderruns: ${totalAudioUnderruns} (${auPerMin}/min)  Drift: ${totalDriftSkips}/${totalDriftRepeats} (${dfPerMin}/min)  RearmTrim: ${rearmTrimMs}ms (${rtPerMinMs}ms/min)  ClickTrim: ${clickTrimMs}ms (${ctPerMinMs}ms/min)  Buffer: ${armedCount}/${losslessPeers} armed ${bufMs}ms / target ${targetMs}ms  Ratio: ${ratioPpm}ppm/${ratioUpdates}u${learnText}  ~${kbps} kbps`;
+    if (_statsNode) _statsNode.textContent = `Frames: ${totalFrames}  SeqDrops: ${totalSeqDrops}  Concealed: ${totalConcealed}  AudioUnderruns: ${totalAudioUnderruns} (${auPerMin}/min)  Partial: ${totalPartialUnderruns}  Drift: ${totalDriftSkips}/${totalDriftRepeats} (${dfPerMin}/min)  RearmTrim: ${rearmTrimMs}ms (${rtPerMinMs}ms/min)  ClickTrim: ${clickTrimMs}ms (${ctPerMinMs}ms/min)  Reorder: ${totalPendingPackets}/${maxReorderWindow}  Late: ${totalLateDrops} dup ${totalDuplicateDrops}  Buffer: ${armedCount}/${losslessPeers} armed ${bufMs}ms / target ${targetMs}ms  Ratio: ${ratioPpm}ppm/${ratioUpdates}u${learnText}  ~${kbps} kbps`;
 
     // Conditional visibility — Disable when lossless is playing, Retry when Opus is.
     if (_disableBtn) {
@@ -1089,6 +1238,13 @@
       peer.seqDrops = 0;
       peer.audioUnderruns = 0;
       peer.concealed = 0;
+      peer.partialUnderruns = 0;
+      peer.lateDrops = 0;
+      peer.duplicateDrops = 0;
+      peer.expectedSeq = -1;
+      if (peer.pendingPackets) peer.pendingPackets.clear();
+      peer.acceptFrames = PROMOTE_DELAY_MS <= 0;
+      if (peer.promoteTimer) { clearTimeout(peer.promoteTimer); peer.promoteTimer = null; }
       peer.driftSkips = 0;
       peer.driftRepeats = 0;
       peer.rearmTrimFrames = 0;
@@ -1121,6 +1277,7 @@
         await _ensureAudio(peer.handshake.sampleRate);
         await _buildWorkletNode(peer);
         _sendLosslessAck(peer);
+        _armLosslessPromotion(peer);
       } catch (e) { warn(`retry rebuild failed: ${e.message}`); }
     }
     _updateOverlay();
@@ -1132,7 +1289,9 @@
       if (!p.handshake || p.frames === 0) continue;
       const age = now - p.lastFrameMs;
       const ratioPpm = Math.round(((p.resamplerRatio || 1.0) - 1.0) * 1000000);
-      log(`stats: frames=${p.frames} seqDrops=${p.seqDrops} audioUnderruns=${p.audioUnderruns} concealed=${p.concealed} buffer=${p.bufferFrames}f ratio=${ratioPpm}ppm ~${Math.round((p.bytes * 8) / (p.frames * REQUESTED_FRAME_MS / 1000) / 1000)}kbps state=${age < FALLBACK_MS ? 'active' : 'silent'} lastFrame=${age}ms ago`);
+      if (DEBUG_ON) {
+        log(`stats: frames=${p.frames} seqDrops=${p.seqDrops} audioUnderruns=${p.audioUnderruns} concealed=${p.concealed} buffer=${p.bufferFrames}f ratio=${ratioPpm}ppm ~${Math.round((p.bytes * 8) / (p.frames * REQUESTED_FRAME_MS / 1000) / 1000)}kbps state=${age < FALLBACK_MS ? 'active' : 'silent'} lastFrame=${age}ms ago`);
+      }
     }
     _updateOverlay();
   }, 1000);
